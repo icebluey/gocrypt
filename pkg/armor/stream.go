@@ -1,6 +1,7 @@
 package armor
 
 import (
+	"bufio"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -11,7 +12,7 @@ import (
 // MessageWriter streams ASCII armor output for PGP MESSAGE blocks.
 type MessageWriter struct {
 	blockType  string
-	w          io.Writer
+	w          *bufio.Writer
 	enc        io.WriteCloser
 	breaker    *lineBreaker
 	includeCRC bool
@@ -25,14 +26,15 @@ func NewMessageWriter(w io.Writer, blockType string, headers map[string]string, 
 	if blockType == "" {
 		return nil, errors.New("armor: block type required")
 	}
+	bw := bufio.NewWriterSize(w, 32*1024)
 	mw := &MessageWriter{
 		blockType:  blockType,
-		w:          w,
+		w:          bw,
 		includeCRC: includeCRC,
 		crc:        0xB704CE,
 	}
 
-	if _, err := fmt.Fprintf(w, "-----BEGIN %s-----\n", blockType); err != nil {
+	if _, err := fmt.Fprintf(bw, "-----BEGIN %s-----\n", blockType); err != nil {
 		return nil, err
 	}
 	if len(headers) > 0 {
@@ -42,16 +44,16 @@ func NewMessageWriter(w io.Writer, blockType string, headers map[string]string, 
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			if _, err := fmt.Fprintf(w, "%s: %s\n", k, headers[k]); err != nil {
+			if _, err := fmt.Fprintf(bw, "%s: %s\n", k, headers[k]); err != nil {
 				return nil, err
 			}
 		}
 	}
-	if _, err := io.WriteString(w, "\n"); err != nil {
+	if _, err := io.WriteString(bw, "\n"); err != nil {
 		return nil, err
 	}
 
-	mw.breaker = &lineBreaker{w: w}
+	mw.breaker = &lineBreaker{w: bw}
 	mw.enc = base64.NewEncoder(base64.StdEncoding, mw.breaker)
 	return mw, nil
 }
@@ -103,8 +105,10 @@ func (mw *MessageWriter) Close() error {
 			return err
 		}
 	}
-	_, err := fmt.Fprintf(mw.w, "-----END %s-----\n", mw.blockType)
-	return err
+	if _, err := fmt.Fprintf(mw.w, "-----END %s-----\n", mw.blockType); err != nil {
+		return err
+	}
+	return mw.w.Flush()
 }
 
 type lineBreaker struct {
@@ -113,27 +117,53 @@ type lineBreaker struct {
 }
 
 func (lb *lineBreaker) Write(p []byte) (int, error) {
-	for i, b := range p {
+	written := 0
+	for len(p) > 0 {
 		if lb.col == 64 {
-			if _, err := lb.w.Write([]byte{'\n'}); err != nil {
-				return i, err
+			if err := lb.writeNewline(); err != nil {
+				return written, err
 			}
-			lb.col = 0
 		}
-		if _, err := lb.w.Write([]byte{b}); err != nil {
-			return i, err
+		remaining := 64 - lb.col
+		if remaining == 0 {
+			continue
 		}
-		lb.col++
+		n := len(p)
+		if n > remaining {
+			n = remaining
+		}
+		m, err := lb.w.Write(p[:n])
+		written += m
+		lb.col += m
+		if err != nil {
+			return written, err
+		}
+		if m < n {
+			return written, io.ErrShortWrite
+		}
+		p = p[n:]
 	}
-	return len(p), nil
+	return written, nil
 }
 
 func (lb *lineBreaker) Close() error {
 	if lb.col > 0 {
+		return lb.writeNewline()
+	}
+	return nil
+}
+
+func (lb *lineBreaker) writeNewline() error {
+	if bw, ok := lb.w.(interface{ WriteByte(byte) error }); ok {
+		if err := bw.WriteByte('\n'); err != nil {
+			return err
+		}
+	} else {
 		if _, err := lb.w.Write([]byte{'\n'}); err != nil {
 			return err
 		}
 	}
+	lb.col = 0
 	return nil
 }
 
