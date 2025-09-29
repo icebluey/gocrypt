@@ -436,7 +436,6 @@ func keygen(args []string) {
 			}
 			if out != "" {
 				writeKeyArmor(out, armPub, armSec)
-				writeKeyFiles(out, pubB64, privB64)
 			}
 		} else {
 			if out == "" {
@@ -466,7 +465,6 @@ func keygen(args []string) {
 			}
 			if out != "" {
 				writeKeyArmor(out, armPub, armSec)
-				writeKeyFiles(out, pubB64, privB64)
 			}
 		} else {
 			if out == "" {
