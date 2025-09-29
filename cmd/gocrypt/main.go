@@ -57,7 +57,7 @@ func encrypt(args []string) {
 	var pkalg string
 	var pkb64 string
 	fs.BoolVar(&outArmor, "armor", false, "ASCII armor output (default: binary)")
-	fs.StringVar(&format, "format", "ietf", "container format: ietf|librepgp")
+	fs.StringVar(&format, "format", "rfc9580", "container format: rfc9580|librepgp")
 	fs.StringVar(&sym, "sym", "aes256", "symmetric: aes128|aes192|aes256")
 	fs.StringVar(&pkalg, "pkalg", "x448", "recipient alg: x25519|x448")
 	fs.StringVar(&pkb64, "pk", "", "recipient public key (raw) base64")
@@ -111,7 +111,7 @@ func encrypt(args []string) {
 	// Content packet
 	const chunkBits = 16 // 4 MiB chunks
 	var content []byte
-	if strings.ToLower(format) == "ietf" {
+	if strings.ToLower(format) == "rfc9580" {
 		content, err = pgp.BuildSEIPDv2OCB(symID, chunkBits, cek, plaintext)
 	} else if strings.ToLower(format) == "librepgp" {
 		content, err = pgp.BuildOCBED(symID, chunkBits, cek, plaintext)
@@ -125,7 +125,7 @@ func encrypt(args []string) {
 	// Output
 	if outArmor {
 		var arm []byte
-		if strings.ToLower(format) == "ietf" {
+		if strings.ToLower(format) == "rfc9580" {
 			arm = armor.ArmorPGPMessageNoCRC(container, nil)
 		} else {
 			arm = armor.ArmorPGPMessage(container, nil)
@@ -141,7 +141,7 @@ func decrypt(args []string) {
 	var format string
 	var pkalg string
 	var pkb64 string
-	fs.StringVar(&format, "format", "ietf", "container format")
+	fs.StringVar(&format, "format", "rfc9580", "container format")
 	fs.StringVar(&pkalg, "pkalg", "x448", "recipient alg: x25519|x448")
 	fs.StringVar(&pkb64, "pk", "", "recipient private key (raw) base64")
 	fs.StringVar(&outPath, "out", "", "output file (default: stdout)")
