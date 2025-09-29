@@ -25,14 +25,19 @@ func writeOut(b []byte) error {
 		return err
 	}
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer f.Close()
 	_, err = f.Write(b)
 	return err
 }
 
 func fatalIf(err error) {
-	if err != nil { fmt.Fprintln(os.Stderr, err); os.Exit(1) }
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
 func fatalf(format string, a ...interface{}) { fmt.Fprintf(os.Stderr, format+"\n", a...); os.Exit(1) }
 
@@ -47,7 +52,6 @@ func main() {
 	}
 	encrypt(os.Args[1:])
 }
-
 
 func encrypt(args []string) {
 	fs := flag.NewFlagSet("encrypt", flag.ExitOnError)
@@ -64,44 +68,66 @@ func encrypt(args []string) {
 	fs.StringVar(&outPath, "out", "", "output file (default: stdout)")
 	fatalIf(fs.Parse(args))
 
-	if pkb64 == "" { fatalf("missing -pk") }
+	if pkb64 == "" {
+		fatalf("missing -pk")
+	}
 
 	// Read plaintext: positional file or stdin
 	var plaintext []byte
 	if rest := fs.Args(); len(rest) > 0 && rest[0] != "-" {
 		inFile := rest[0]
-		data, err := os.ReadFile(inFile); fatalIf(err)
+		data, err := os.ReadFile(inFile)
+		fatalIf(err)
 		plaintext = data
 		if outPath == "" {
-			if outArmor { outPath = inFile + ".asc" } else { outPath = inFile + ".pgp" }
+			if outArmor {
+				outPath = inFile + ".asc"
+			} else {
+				outPath = inFile + ".pgp"
+			}
 		}
 	} else {
-		data, err := io.ReadAll(os.Stdin); fatalIf(err)
+		data, err := io.ReadAll(os.Stdin)
+		fatalIf(err)
 		plaintext = data
 	}
 
 	// Decode recipient public key
-	pubRaw, err := base64.StdEncoding.DecodeString(pkb64); fatalIf(err)
+	pubRaw, err := base64.StdEncoding.DecodeString(pkb64)
+	fatalIf(err)
 
 	// Symmetric algorithm and session key
 	var symID int
 	var cekLen int
 	switch strings.ToLower(sym) {
-	case "aes128": symID = pgp.SYM_AES128; cekLen = 16
-	case "aes192": symID = pgp.SYM_AES192; cekLen = 24
-	case "aes256": symID = pgp.SYM_AES256; cekLen = 32
-	default: fatalf("unsupported -sym: %s", sym)
+	case "aes128":
+		symID = pgp.SYM_AES128
+		cekLen = 16
+	case "aes192":
+		symID = pgp.SYM_AES192
+		cekLen = 24
+	case "aes256":
+		symID = pgp.SYM_AES256
+		cekLen = 32
+	default:
+		fatalf("unsupported -sym: %s", sym)
 	}
-	cek := make([]byte, cekLen); _, err = rand.Read(cek); fatalIf(err)
+	cek := make([]byte, cekLen)
+	_, err = rand.Read(cek)
+	fatalIf(err)
 
 	// PKESK (v6) for X25519/X448
 	var pkesk []byte
 	switch strings.ToLower(pkalg) {
 	case "x25519":
-		if len(pubRaw) != 32 { fatalf("x25519 pub must be 32 bytes (raw base64)") }
+		if len(pubRaw) != 32 {
+			fatalf("x25519 pub must be 32 bytes (raw base64)")
+		}
 		pkesk, err = pgp.BuildPKESKv6_X(pgp.PKALG_X25519, pubRaw, cek)
 	case "x448":
-		if len(pubRaw) != 56 { fatalf("x448 pub must be 56 bytes (raw base64)") }
+		if len(pubRaw) != 56 {
+			fatalf("x448 pub must be 56 bytes (raw base64)")
+		}
 		pkesk, err = pgp.BuildPKESKv6_X(pgp.PKALG_X448, pubRaw, cek)
 	default:
 		fatalf("unsupported -pkalg: %s", pkalg)
@@ -150,34 +176,48 @@ func decrypt(args []string) {
 	// Input: positional filename or stdin
 	var inData []byte
 	if rest := fs.Args(); len(rest) > 0 && rest[0] != "-" {
-		b, err := os.ReadFile(rest[0]); fatalIf(err)
+		b, err := os.ReadFile(rest[0])
+		fatalIf(err)
 		inData = b
 	} else {
-		b, err := io.ReadAll(os.Stdin); fatalIf(err)
+		b, err := io.ReadAll(os.Stdin)
+		fatalIf(err)
 		inData = b
 	}
-	if pkb64 == "" { fatalf("missing -pk (private key base64)") }
-	priv, err := base64.StdEncoding.DecodeString(pkb64); fatalIf(err)
+	if pkb64 == "" {
+		fatalf("missing -pk (private key base64)")
+	}
+	priv, err := base64.StdEncoding.DecodeString(pkb64)
+	fatalIf(err)
 
 	msg := inData
-	if dec, ok := armor.DecodePGPMessage(msg); ok { msg = dec }
+	if dec, ok := armor.DecodePGPMessage(msg); ok {
+		msg = dec
+	}
 
-	tag, body, rest, err := pgp.ReadPacket(msg); fatalIf(err)
-	if tag != 1 { fatalf("first packet is not PKESK") }
-	cek, err := pgp.DecodePKESK_X(body, pkalg, priv); fatalIf(err)
+	tag, body, rest, err := pgp.ReadPacket(msg)
+	fatalIf(err)
+	if tag != 1 {
+		fatalf("first packet is not PKESK")
+	}
+	cek, err := pgp.DecodePKESK_X(body, pkalg, priv)
+	fatalIf(err)
 
-	tag2, body2, _, err := pgp.ReadPacket(rest); fatalIf(err)
+	tag2, body2, _, err := pgp.ReadPacket(rest)
+	fatalIf(err)
 	switch tag2 {
 	case 18:
-		pt, err := pgp.DecryptSEIPDv2OCB(body2, cek); fatalIf(err); fatalIf(writeOut(pt))
+		pt, err := pgp.DecryptSEIPDv2OCB(body2, cek)
+		fatalIf(err)
+		fatalIf(writeOut(pt))
 	case 20:
-		pt, err := pgp.DecryptOCBED(body2, cek); fatalIf(err); fatalIf(writeOut(pt))
+		pt, err := pgp.DecryptOCBED(body2, cek)
+		fatalIf(err)
+		fatalIf(writeOut(pt))
 	default:
 		fatalf("unsupported data tag: %d", tag2)
 	}
 }
-
-
 
 func keygen(args []string) {
 	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
@@ -185,46 +225,70 @@ func keygen(args []string) {
 	var out string
 	var armorOut bool
 	fs.StringVar(&algo, "pkalg", "x448", "key algorithm: x25519|x448")
-	fs.StringVar(&out, "out", "", "file prefix to write keys (*.pub.asc / *.key.asc and/or *.b64)")
+	fs.StringVar(&out, "out", "", "file prefix to write keys (*.pub.asc / *.key.asc and/or *.pub / *.key)")
 	fs.BoolVar(&armorOut, "armor", false, "print OpenPGP Key Block armor to stdout (default prints base64 raw keys)")
 	fatalIf(fs.Parse(args))
 
 	switch strings.ToLower(algo) {
 	case "x25519":
 		var sk, pk x25519.Key
-		_, err := rand.Read(sk[:]); fatalIf(err)
+		_, err := rand.Read(sk[:])
+		fatalIf(err)
 		x25519.KeyGen(&pk, &sk)
 		pubB64 := base64.StdEncoding.EncodeToString(pk[:])
 		privB64 := base64.StdEncoding.EncodeToString(sk[:])
 		if armorOut {
-			pubPkt, err := pgp.BuildPublicKeyV6(pgp.PKALG_X25519, pk[:]); fatalIf(err)
-			secPkt, err := pgp.BuildSecretKeyV6(pgp.PKALG_X25519, pk[:], sk[:]); fatalIf(err)
+			pubPkt, err := pgp.BuildPublicKeyV6(pgp.PKALG_X25519, pk[:])
+			fatalIf(err)
+			secPkt, err := pgp.BuildSecretKeyV6(pgp.PKALG_X25519, pk[:], sk[:])
+			fatalIf(err)
 			armPub := armor.ArmorEncode("PGP PUBLIC KEY BLOCK", pubPkt, nil)
 			armSec := armor.ArmorEncode("PGP PRIVATE KEY BLOCK", secPkt, nil)
-			os.Stdout.Write(armPub)
-			os.Stdout.Write(armSec)
-			if out != "" { writeKeyArmor(out, armPub, armSec); writeKeyFiles(out, pubB64, privB64) }
+			if out == "" {
+				os.Stdout.Write(armPub)
+				os.Stdout.Write(armSec)
+			}
+			if out != "" {
+				writeKeyArmor(out, armPub, armSec)
+				writeKeyFiles(out, pubB64, privB64)
+			}
 		} else {
-			fmt.Printf("PUBLIC=%s\nPRIVATE=%s\n", pubB64, privB64)
-			if out != "" { writeKeyFiles(out, pubB64, privB64) }
+			if out == "" {
+				fmt.Printf("PUBLIC=%s\nPRIVATE=%s\n", pubB64, privB64)
+			}
+			if out != "" {
+				writeKeyFiles(out, pubB64, privB64)
+			}
 		}
 	case "x448":
 		var sk, pk x448.Key
-		_, err := rand.Read(sk[:]); fatalIf(err)
+		_, err := rand.Read(sk[:])
+		fatalIf(err)
 		x448.KeyGen(&pk, &sk)
 		pubB64 := base64.StdEncoding.EncodeToString(pk[:])
 		privB64 := base64.StdEncoding.EncodeToString(sk[:])
 		if armorOut {
-			pubPkt, err := pgp.BuildPublicKeyV6(pgp.PKALG_X448, pk[:]); fatalIf(err)
-			secPkt, err := pgp.BuildSecretKeyV6(pgp.PKALG_X448, pk[:], sk[:]); fatalIf(err)
+			pubPkt, err := pgp.BuildPublicKeyV6(pgp.PKALG_X448, pk[:])
+			fatalIf(err)
+			secPkt, err := pgp.BuildSecretKeyV6(pgp.PKALG_X448, pk[:], sk[:])
+			fatalIf(err)
 			armPub := armor.ArmorEncode("PGP PUBLIC KEY BLOCK", pubPkt, nil)
 			armSec := armor.ArmorEncode("PGP PRIVATE KEY BLOCK", secPkt, nil)
-			os.Stdout.Write(armPub)
-			os.Stdout.Write(armSec)
-			if out != "" { writeKeyArmor(out, armPub, armSec); writeKeyFiles(out, pubB64, privB64) }
+			if out == "" {
+				os.Stdout.Write(armPub)
+				os.Stdout.Write(armSec)
+			}
+			if out != "" {
+				writeKeyArmor(out, armPub, armSec)
+				writeKeyFiles(out, pubB64, privB64)
+			}
 		} else {
-			fmt.Printf("PUBLIC=%s\nPRIVATE=%s\n", pubB64, privB64)
-			if out != "" { writeKeyFiles(out, pubB64, privB64) }
+			if out == "" {
+				fmt.Printf("PUBLIC=%s\nPRIVATE=%s\n", pubB64, privB64)
+			}
+			if out != "" {
+				writeKeyFiles(out, pubB64, privB64)
+			}
 		}
 	default:
 		fatalf("unsupported pkalg: %s", algo)
@@ -232,11 +296,13 @@ func keygen(args []string) {
 }
 func writeKeyFiles(prefix, pubB64, privB64 string) {
 	_ = os.MkdirAll(filepath.Dir(prefix), 0o755)
-	_ = os.WriteFile(prefix+".pub.b64", []byte(pubB64+"\n"), 0644)
-	f := prefix + ".key.b64"
-	fd, err := os.OpenFile(f, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); fatalIf(err)
+	_ = os.WriteFile(prefix+".pub", []byte(pubB64+"\n"), 0644)
+	f := prefix + ".key"
+	fd, err := os.OpenFile(f, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	fatalIf(err)
 	defer fd.Close()
-	_, err = fd.Write([]byte(privB64+"\n")); fatalIf(err)
+	_, err = fd.Write([]byte(privB64 + "\n"))
+	fatalIf(err)
 }
 
 func writeKeyArmor(prefix string, pubAsc, secAsc []byte) {
