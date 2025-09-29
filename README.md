@@ -19,12 +19,47 @@ go build ./cmd/gocrypt
 
 ## Usage
 
-Recipient key is passed as raw base64 of X25519/X448 public key bytes (not a full OpenPGP certificate):
+### Generate a key pair
 
 ```bash
-# Example (uses random message; replace PK with actual raw public key)
-echo 'hello' | ./gocrypt -format=rfc9580 -pkalg=x448 -pk=<BASE64> -sym=aes256 -out msg.asc
+./gocrypt keygen -pkalg=x448 -armor -out keys/x448
 ```
+
+This creates `keys/x448.pub.asc` and `keys/x448.key.asc`. The `.asc` files are
+OpenPGP-armored Tag 6/Tag 5 packets that carry the raw X448 material expected
+by the CLI.
+
+### Encrypt using a public key file
+
+```bash
+echo 'hello' | ./gocrypt \
+  -format=rfc9580 \
+  -sym=aes256 \
+  -pubfile=keys/x448.pub.asc \
+  -out msg.asc
+```
+
+`-pubfile` accepts either the armored output shown above or the raw base64
+(`keys/x448.pub`) produced when `-armor` is omitted. The tool automatically
+detects whether the key is X25519 or X448; use `-pkalg` only if you need to
+override detection.
+
+### Decrypt using the matching private key
+
+```bash
+./gocrypt decrypt \
+  -keyfile=keys/x448.key.asc \
+  -out plaintext.txt \
+  msg.asc
+```
+
+`-keyfile` mirrors `-pubfile` and supports `.key.asc` as well as the raw
+`keys/x448.key` file. The command writes the decrypted message to `stdout` when
+`-out` is omitted.
+
+If you already have the raw base64 strings, the original `-pk=<BASE64>` flag is
+still available for both encryption (public key) and `decrypt` (private key);
+pass `-pkalg` to choose between X25519 and X448 in that mode.
 
 ## Notes
 

@@ -28,6 +28,115 @@ func fatalIf(err error) {
 }
 func fatalf(format string, a ...interface{}) { fmt.Fprintf(os.Stderr, format+"\n", a...); os.Exit(1) }
 
+type stringFlag struct {
+	value string
+	set   bool
+}
+
+func (s *stringFlag) String() string { return s.value }
+
+func (s *stringFlag) Set(v string) error {
+	s.value = v
+	s.set = true
+	return nil
+}
+
+func parsePKAlg(name string) (int, error) {
+	switch strings.ToLower(name) {
+	case "x25519":
+		return pgp.PKALG_X25519, nil
+	case "x448":
+		return pgp.PKALG_X448, nil
+	default:
+		return 0, fmt.Errorf("unsupported -pkalg: %s", name)
+	}
+}
+
+func pkAlgName(alg int) string {
+	switch alg {
+	case pgp.PKALG_X25519:
+		return "x25519"
+	case pgp.PKALG_X448:
+		return "x448"
+	default:
+		return fmt.Sprintf("alg-%d", alg)
+	}
+}
+
+func loadPublicKeyFromFile(path string) ([]byte, int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 {
+		return nil, 0, fmt.Errorf("public key file %s is empty", path)
+	}
+	if bytes.Contains(data, []byte("-----BEGIN")) {
+		blockType, _, raw, ok := armor.ArmorDecode(data)
+		if !ok || blockType != "PGP PUBLIC KEY BLOCK" {
+			return nil, 0, fmt.Errorf("%s: expected PGP PUBLIC KEY BLOCK", path)
+		}
+		data = raw
+	}
+	if len(data) > 0 && (data[0]&0xC0) == 0xC0 {
+		alg, pub, err := pgp.ParsePublicKeyV6(data)
+		if err != nil {
+			return nil, 0, err
+		}
+		return append([]byte(nil), pub...), alg, nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(string(bytes.TrimSpace(data)))
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid public key encoding in %s: %w", path, err)
+	}
+	switch len(decoded) {
+	case 32:
+		return decoded, pgp.PKALG_X25519, nil
+	case 56:
+		return decoded, pgp.PKALG_X448, nil
+	default:
+		return nil, 0, fmt.Errorf("public key length %d in %s not recognized", len(decoded), path)
+	}
+}
+
+func loadPrivateKeyFromFile(path string) ([]byte, int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 {
+		return nil, 0, fmt.Errorf("private key file %s is empty", path)
+	}
+	if bytes.Contains(data, []byte("-----BEGIN")) {
+		blockType, _, raw, ok := armor.ArmorDecode(data)
+		if !ok || blockType != "PGP PRIVATE KEY BLOCK" {
+			return nil, 0, fmt.Errorf("%s: expected PGP PRIVATE KEY BLOCK", path)
+		}
+		data = raw
+	}
+	if len(data) > 0 && (data[0]&0xC0) == 0xC0 {
+		alg, _, priv, err := pgp.ParseSecretKeyV6(data)
+		if err != nil {
+			return nil, 0, err
+		}
+		return append([]byte(nil), priv...), alg, nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(string(bytes.TrimSpace(data)))
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid private key encoding in %s: %w", path, err)
+	}
+	switch len(decoded) {
+	case 32:
+		return decoded, pgp.PKALG_X25519, nil
+	case 56:
+		return decoded, pgp.PKALG_X448, nil
+	default:
+		return nil, 0, fmt.Errorf("private key length %d in %s not recognized", len(decoded), path)
+	}
+}
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "keygen" {
 		keygen(os.Args[2:])
@@ -45,19 +154,25 @@ func encrypt(args []string) {
 	var outArmor bool
 	var format string
 	var sym string
-	var pkalg string
 	var pkb64 string
+	var pubFile string
 	var outPath string
+	var pkalg stringFlag
+	pkalg.value = "x448"
 	fs.BoolVar(&outArmor, "armor", false, "ASCII armor output (default: binary)")
 	fs.StringVar(&format, "format", "rfc9580", "container format: rfc9580|librepgp")
 	fs.StringVar(&sym, "sym", "aes256", "symmetric: aes128|aes192|aes256")
-	fs.StringVar(&pkalg, "pkalg", "x448", "recipient alg: x25519|x448")
+	fs.Var(&pkalg, "pkalg", "recipient alg: x25519|x448 (used with -pk or to override autodetect)")
 	fs.StringVar(&pkb64, "pk", "", "recipient public key (raw) base64")
+	fs.StringVar(&pubFile, "pubfile", "", "recipient public key file (.pub|.pub.asc)")
 	fs.StringVar(&outPath, "out", "", "output file (default: stdout)")
 	fatalIf(fs.Parse(args))
 
-	if pkb64 == "" {
-		fatalf("missing -pk")
+	if pkb64 != "" && pubFile != "" {
+		fatalf("use either -pk or -pubfile")
+	}
+	if pkb64 == "" && pubFile == "" {
+		fatalf("missing -pk or -pubfile")
 	}
 
 	var input io.Reader
@@ -82,8 +197,26 @@ func encrypt(args []string) {
 	}
 	plainReader := bufio.NewReader(input)
 
-	pubRaw, err := base64.StdEncoding.DecodeString(pkb64)
-	fatalIf(err)
+	var pubRaw []byte
+	var pkAlgID int
+	var err error
+	if pkb64 != "" {
+		pubRaw, err = base64.StdEncoding.DecodeString(pkb64)
+		fatalIf(err)
+		pkAlgID, err = parsePKAlg(pkalg.value)
+		fatalIf(err)
+	} else {
+		pubRaw, pkAlgID, err = loadPublicKeyFromFile(pubFile)
+		fatalIf(err)
+		if pkalg.set {
+			want, err := parsePKAlg(pkalg.value)
+			fatalIf(err)
+			if want != pkAlgID {
+				fatalf("public key algorithm mismatch: file is %s but -pkalg=%s", pkAlgName(pkAlgID), pkalg.value)
+			}
+			pkAlgID = want
+		}
+	}
 
 	var symID int
 	var cekLen int
@@ -105,19 +238,19 @@ func encrypt(args []string) {
 	fatalIf(err)
 
 	var pkesk []byte
-	switch strings.ToLower(pkalg) {
-	case "x25519":
+	switch pkAlgID {
+	case pgp.PKALG_X25519:
 		if len(pubRaw) != 32 {
 			fatalf("x25519 pub must be 32 bytes (raw base64)")
 		}
 		pkesk, err = pgp.BuildPKESKv6_X(pgp.PKALG_X25519, pubRaw, cek)
-	case "x448":
+	case pgp.PKALG_X448:
 		if len(pubRaw) != 56 {
 			fatalf("x448 pub must be 56 bytes (raw base64)")
 		}
 		pkesk, err = pgp.BuildPKESKv6_X(pgp.PKALG_X448, pubRaw, cek)
 	default:
-		fatalf("unsupported -pkalg: %s", pkalg)
+		fatalf("unsupported public key algorithm: %d", pkAlgID)
 	}
 	fatalIf(err)
 
@@ -184,17 +317,23 @@ func encrypt(args []string) {
 
 func decrypt(args []string) {
 	fs := flag.NewFlagSet("decrypt", flag.ExitOnError)
-	var pkalg string
 	var pkb64 string
+	var keyFile string
 	var outPath string
+	var pkalg stringFlag
+	pkalg.value = "x448"
 	fs.StringVar(new(string), "format", "rfc9580", "container format")
-	fs.StringVar(&pkalg, "pkalg", "x448", "recipient alg: x25519|x448")
+	fs.Var(&pkalg, "pkalg", "recipient alg: x25519|x448 (used with -pk or to override autodetect)")
 	fs.StringVar(&pkb64, "pk", "", "recipient private key (raw) base64")
+	fs.StringVar(&keyFile, "keyfile", "", "recipient private key file (.key|.key.asc)")
 	fs.StringVar(&outPath, "out", "", "output file (default: stdout)")
 	fatalIf(fs.Parse(args))
 
-	if pkb64 == "" {
-		fatalf("missing -pk (private key base64)")
+	if pkb64 != "" && keyFile != "" {
+		fatalf("use either -pk or -keyfile")
+	}
+	if pkb64 == "" && keyFile == "" {
+		fatalf("missing -pk (private key base64) or -keyfile")
 	}
 
 	var input io.Reader
@@ -226,8 +365,26 @@ func decrypt(args []string) {
 		}()
 	}
 
-	priv, err := base64.StdEncoding.DecodeString(pkb64)
-	fatalIf(err)
+	var priv []byte
+	var pkAlgID int
+	var err error
+	if pkb64 != "" {
+		priv, err = base64.StdEncoding.DecodeString(pkb64)
+		fatalIf(err)
+		pkAlgID, err = parsePKAlg(pkalg.value)
+		fatalIf(err)
+	} else {
+		priv, pkAlgID, err = loadPrivateKeyFromFile(keyFile)
+		fatalIf(err)
+		if pkalg.set {
+			want, err := parsePKAlg(pkalg.value)
+			fatalIf(err)
+			if want != pkAlgID {
+				fatalf("private key algorithm mismatch: file is %s but -pkalg=%s", pkAlgName(pkAlgID), pkalg.value)
+			}
+			pkAlgID = want
+		}
+	}
 
 	tag, bodyLen, err := pgp.ReadPacketHeader(reader)
 	fatalIf(err)
@@ -238,7 +395,20 @@ func decrypt(args []string) {
 	if _, err := io.ReadFull(reader, body); err != nil {
 		fatalIf(err)
 	}
-	cek, err := pgp.DecodePKESK_X(body, pkalg, priv)
+	switch pkAlgID {
+	case pgp.PKALG_X25519:
+		if len(priv) != 32 {
+			fatalf("x25519 private key must be 32 bytes (raw base64)")
+		}
+	case pgp.PKALG_X448:
+		if len(priv) != 56 {
+			fatalf("x448 private key must be 56 bytes (raw base64)")
+		}
+	default:
+		fatalf("unsupported private key algorithm: %d", pkAlgID)
+	}
+
+	cek, err := pgp.DecodePKESK_X(body, pkAlgName(pkAlgID), priv)
 	fatalIf(err)
 
 	tag2, bodyLen2, err := pgp.ReadPacketHeader(reader)
