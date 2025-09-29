@@ -23,7 +23,7 @@ Recipient key is passed as raw base64 of X25519/X448 public key bytes (not a ful
 
 ```bash
 # Example (uses random message; replace PK with actual raw public key)
-echo 'hello' | ./gocrypt -format=ietf -pkalg=x448 -pk=<BASE64> -sym=aes256 > msg.asc
+echo 'hello' | ./gocrypt -format=ietf -pkalg=x448 -pk=<BASE64> -sym=aes256 -out msg.asc
 ```
 
 ## Notes
