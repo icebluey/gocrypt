@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,22 +19,6 @@ import (
 	"github.com/cloudflare/circl/dh/x25519"
 	"github.com/cloudflare/circl/dh/x448"
 )
-
-var outPath string
-
-func writeOut(b []byte) error {
-	if outPath == "" {
-		_, err := os.Stdout.Write(b)
-		return err
-	}
-	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = f.Write(b)
-	return err
-}
 
 func fatalIf(err error) {
 	if err != nil {
@@ -60,6 +47,7 @@ func encrypt(args []string) {
 	var sym string
 	var pkalg string
 	var pkb64 string
+	var outPath string
 	fs.BoolVar(&outArmor, "armor", false, "ASCII armor output (default: binary)")
 	fs.StringVar(&format, "format", "rfc9580", "container format: rfc9580|librepgp")
 	fs.StringVar(&sym, "sym", "aes256", "symmetric: aes128|aes192|aes256")
@@ -72,31 +60,31 @@ func encrypt(args []string) {
 		fatalf("missing -pk")
 	}
 
-	// Read plaintext: positional file or stdin
-	var plaintext []byte
+	var input io.Reader
+	var inputCloser io.Closer
 	if rest := fs.Args(); len(rest) > 0 && rest[0] != "-" {
-		inFile := rest[0]
-		data, err := os.ReadFile(inFile)
+		f, err := os.Open(rest[0])
 		fatalIf(err)
-		plaintext = data
+		input = f
+		inputCloser = f
 		if outPath == "" {
 			if outArmor {
-				outPath = inFile + ".asc"
+				outPath = rest[0] + ".asc"
 			} else {
-				outPath = inFile + ".pgp"
+				outPath = rest[0] + ".pgp"
 			}
 		}
 	} else {
-		data, err := io.ReadAll(os.Stdin)
-		fatalIf(err)
-		plaintext = data
+		input = os.Stdin
 	}
+	if inputCloser != nil {
+		defer inputCloser.Close()
+	}
+	plainReader := bufio.NewReader(input)
 
-	// Decode recipient public key
 	pubRaw, err := base64.StdEncoding.DecodeString(pkb64)
 	fatalIf(err)
 
-	// Symmetric algorithm and session key
 	var symID int
 	var cekLen int
 	switch strings.ToLower(sym) {
@@ -116,7 +104,6 @@ func encrypt(args []string) {
 	_, err = rand.Read(cek)
 	fatalIf(err)
 
-	// PKESK (v6) for X25519/X448
 	var pkesk []byte
 	switch strings.ToLower(pkalg) {
 	case "x25519":
@@ -134,89 +121,288 @@ func encrypt(args []string) {
 	}
 	fatalIf(err)
 
-	// Content packet
-	const chunkBits = 16 // 4 MiB chunks
-	var content []byte
-	if strings.ToLower(format) == "rfc9580" {
-		content, err = pgp.BuildSEIPDv2OCB(symID, chunkBits, cek, plaintext)
-	} else if strings.ToLower(format) == "librepgp" {
-		content, err = pgp.BuildOCBED(symID, chunkBits, cek, plaintext)
+	var outFile *os.File
+	var outWriter io.Writer
+	if outPath == "" {
+		outWriter = os.Stdout
 	} else {
+		outFile, err = os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		fatalIf(err)
+		outWriter = outFile
+	}
+
+	var armorWriter *armor.MessageWriter
+	formatLower := strings.ToLower(format)
+	if outArmor {
+		includeCRC := formatLower != "rfc9580"
+		armorWriter, err = armor.NewPGPMessageWriter(outWriter, nil, includeCRC)
+		fatalIf(err)
+		outWriter = armorWriter
+	}
+
+	tmp, err := os.CreateTemp("", "gocrypt-content-*.bin")
+	fatalIf(err)
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
+
+	const chunkBits = 22
+	var bodyLen int64
+	var contentTag byte
+	switch formatLower {
+	case "rfc9580":
+		bodyLen, err = pgp.WriteSEIPDv2OCBStream(tmp, symID, chunkBits, cek, plainReader)
+		contentTag = 18
+	case "librepgp":
+		bodyLen, err = pgp.WriteOCBEDStream(tmp, symID, chunkBits, cek, plainReader)
+		contentTag = 20
+	default:
 		fatalf("unsupported -format: %s", format)
 	}
 	fatalIf(err)
 
-	container := append(pkesk, content...)
+	_, err = tmp.Seek(0, io.SeekStart)
+	fatalIf(err)
+	if bodyLen > int64(math.MaxInt) {
+		fatalf("content too large")
+	}
 
-	// Output
-	if outArmor {
-		var arm []byte
-		if strings.ToLower(format) == "rfc9580" {
-			arm = armor.ArmorPGPMessageNoCRC(container, nil)
-		} else {
-			arm = armor.ArmorPGPMessage(container, nil)
-		}
-		fatalIf(writeOut(arm))
-	} else {
-		fatalIf(writeOut(container))
+	if _, err := outWriter.Write(pkesk); err != nil {
+		fatalIf(err)
+	}
+	fatalIf(pgp.WritePacketHeader(outWriter, contentTag, int(bodyLen)))
+	if _, err := io.CopyN(outWriter, tmp, bodyLen); err != nil {
+		fatalIf(err)
+	}
+
+	if armorWriter != nil {
+		fatalIf(armorWriter.Close())
+	}
+	if outFile != nil {
+		fatalIf(outFile.Close())
 	}
 }
 
 func decrypt(args []string) {
 	fs := flag.NewFlagSet("decrypt", flag.ExitOnError)
-	var format string
 	var pkalg string
 	var pkb64 string
-	fs.StringVar(&format, "format", "rfc9580", "container format")
+	var outPath string
+	fs.StringVar(new(string), "format", "rfc9580", "container format")
 	fs.StringVar(&pkalg, "pkalg", "x448", "recipient alg: x25519|x448")
 	fs.StringVar(&pkb64, "pk", "", "recipient private key (raw) base64")
 	fs.StringVar(&outPath, "out", "", "output file (default: stdout)")
 	fatalIf(fs.Parse(args))
 
-	// Input: positional filename or stdin
-	var inData []byte
-	if rest := fs.Args(); len(rest) > 0 && rest[0] != "-" {
-		b, err := os.ReadFile(rest[0])
-		fatalIf(err)
-		inData = b
-	} else {
-		b, err := io.ReadAll(os.Stdin)
-		fatalIf(err)
-		inData = b
-	}
 	if pkb64 == "" {
 		fatalf("missing -pk (private key base64)")
 	}
+
+	var input io.Reader
+	var inputCloser io.Closer
+	if rest := fs.Args(); len(rest) > 0 && rest[0] != "-" {
+		f, err := os.Open(rest[0])
+		fatalIf(err)
+		input = f
+		inputCloser = f
+	} else {
+		input = os.Stdin
+	}
+	if inputCloser != nil {
+		defer inputCloser.Close()
+	}
+
+	reader := bufio.NewReader(input)
+	var armorTmp *os.File
+	if looksLikeArmor(reader) {
+		tmp, err := decodeArmorToTemp(reader)
+		fatalIf(err)
+		armorTmp = tmp
+		reader = bufio.NewReader(tmp)
+	}
+	if armorTmp != nil {
+		defer func() {
+			armorTmp.Close()
+			os.Remove(armorTmp.Name())
+		}()
+	}
+
 	priv, err := base64.StdEncoding.DecodeString(pkb64)
 	fatalIf(err)
 
-	msg := inData
-	if dec, ok := armor.DecodePGPMessage(msg); ok {
-		msg = dec
-	}
-
-	tag, body, rest, err := pgp.ReadPacket(msg)
+	tag, bodyLen, err := pgp.ReadPacketHeader(reader)
 	fatalIf(err)
 	if tag != 1 {
 		fatalf("first packet is not PKESK")
 	}
+	body := make([]byte, bodyLen)
+	if _, err := io.ReadFull(reader, body); err != nil {
+		fatalIf(err)
+	}
 	cek, err := pgp.DecodePKESK_X(body, pkalg, priv)
 	fatalIf(err)
 
-	tag2, body2, _, err := pgp.ReadPacket(rest)
+	tag2, bodyLen2, err := pgp.ReadPacketHeader(reader)
 	fatalIf(err)
+	limit := io.LimitReader(reader, int64(bodyLen2))
+
+	var outFile *os.File
+	var outWriter io.Writer
+	if outPath == "" {
+		outWriter = os.Stdout
+	} else {
+		outFile, err = os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		fatalIf(err)
+		outWriter = outFile
+	}
+
 	switch tag2 {
 	case 18:
-		pt, err := pgp.DecryptSEIPDv2OCB(body2, cek)
-		fatalIf(err)
-		fatalIf(writeOut(pt))
+		fatalIf(pgp.DecryptSEIPDv2OCBStream(outWriter, limit, int64(bodyLen2), cek))
 	case 20:
-		pt, err := pgp.DecryptOCBED(body2, cek)
-		fatalIf(err)
-		fatalIf(writeOut(pt))
+		fatalIf(pgp.DecryptOCBEDStream(outWriter, limit, int64(bodyLen2), cek))
 	default:
 		fatalf("unsupported data tag: %d", tag2)
 	}
+
+	if outFile != nil {
+		fatalIf(outFile.Close())
+	}
+}
+
+func looksLikeArmor(r *bufio.Reader) bool {
+	peek, err := r.Peek(64)
+	if err != nil && err != io.EOF {
+		return false
+	}
+	trimmed := strings.TrimSpace(string(peek))
+	return strings.HasPrefix(trimmed, "-----BEGIN ")
+}
+
+func decodeArmorToTemp(r *bufio.Reader) (*os.File, error) {
+	tmp, err := os.CreateTemp("", "gocrypt-armor-*.bin")
+	if err != nil {
+		return nil, err
+	}
+	cleanup := func(e error) (*os.File, error) {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return nil, e
+	}
+
+	// locate begin line
+	var blockType string
+	for {
+		line, err := readLine(r)
+		if err != nil {
+			return cleanup(err)
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "-----BEGIN ") && strings.HasSuffix(trimmed, "-----") {
+			blockType = strings.TrimSuffix(strings.TrimPrefix(trimmed, "-----BEGIN "), "-----")
+			if blockType != "PGP MESSAGE" {
+				return cleanup(fmt.Errorf("unexpected armor block: %s", blockType))
+			}
+			break
+		}
+	}
+
+	// skip headers
+	for {
+		line, err := readLine(r)
+		if err != nil {
+			return cleanup(err)
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	crc := uint32(0xB704CE)
+	var crcExpected []byte
+	hasCRC := false
+
+	for {
+		line, err := readLine(r)
+		if err != nil {
+			return cleanup(err)
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "-----END ") {
+			endType := strings.TrimSuffix(strings.TrimPrefix(trimmed, "-----END "), "-----")
+			if endType != blockType {
+				return cleanup(fmt.Errorf("mismatched armor end: %s", endType))
+			}
+			break
+		}
+		if trimmed[0] == '=' {
+			if hasCRC {
+				return cleanup(fmt.Errorf("multiple armor CRC lines"))
+			}
+			buf := make([]byte, base64.StdEncoding.DecodedLen(len(trimmed)-1))
+			n, err := base64.StdEncoding.Decode(buf, []byte(trimmed[1:]))
+			if err != nil {
+				return cleanup(fmt.Errorf("invalid armor crc: %w", err))
+			}
+			if n != 3 {
+				return cleanup(fmt.Errorf("invalid armor crc length"))
+			}
+			crcExpected = buf[:n]
+			hasCRC = true
+			continue
+		}
+		decoded := make([]byte, base64.StdEncoding.DecodedLen(len(trimmed)))
+		n, err := base64.StdEncoding.Decode(decoded, []byte(trimmed))
+		if err != nil {
+			return cleanup(fmt.Errorf("invalid armor data: %w", err))
+		}
+		decoded = decoded[:n]
+		for _, b := range decoded {
+			crc = crc24Update(crc, b)
+		}
+		if _, err := tmp.Write(decoded); err != nil {
+			return cleanup(err)
+		}
+	}
+
+	if hasCRC {
+		actual := []byte{byte((crc >> 16) & 0xFF), byte((crc >> 8) & 0xFF), byte(crc & 0xFF)}
+		if !bytes.Equal(actual, crcExpected) {
+			return cleanup(fmt.Errorf("armor crc mismatch"))
+		}
+	}
+
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return cleanup(err)
+	}
+	return tmp, nil
+}
+
+func readLine(r *bufio.Reader) (string, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		if err == io.EOF && len(line) > 0 {
+			return line, nil
+		}
+		return "", err
+	}
+	return line, nil
+}
+
+func crc24Update(crc uint32, b byte) uint32 {
+	crc ^= uint32(b) << 16
+	for i := 0; i < 8; i++ {
+		crc <<= 1
+		if (crc & 0x1000000) != 0 {
+			crc ^= 0x1864CF
+		}
+	}
+	return crc & 0xFFFFFF
 }
 
 func keygen(args []string) {
