@@ -5,7 +5,7 @@ A minimal proof of concept showing how to emit OpenPGP-encrypted messages compat
 - v6 PKESK with X25519 or X448 (Concat-KDF + AES-KW)
 - v2 SEIPD (Tag 18) using AEAD=OCB
 - LibrePGP OCBED (Tag 20) using AEAD=OCB
-- Armor (`-a/--armor`) enabled by default
+- Armor (`--armor`) enabled by default
 
 > ⚠️ This is a teaching-oriented PoC. It does **not** implement full key/cert parsing, signature verification, recipient preference negotiation, multi-chunk AEAD, or full KDF parameter encoding. See code comments for what to harden next before production use.
 
