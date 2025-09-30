@@ -3,6 +3,7 @@
 A minimal proof of concept showing how to emit OpenPGP-encrypted messages compatible with **RFC 9580 (IETF, v6)** and with the **LibrePGP draft (Tag 20 OCBED)**. This PoC focuses on encryption and ASCII armor. It supports:
 
 - v6 PKESK with X25519 or X448 (Concat-KDF + AES-KW)
+- LibrePGP §14 hybrid PKESK with ML-KEM768+X25519 or ML-KEM1024+X448
 - v2 SEIPD (Tag 18) using AEAD=OCB
 - LibrePGP OCBED (Tag 20) using AEAD=OCB
 - Armor (`--armor`) enabled by default
@@ -88,6 +89,82 @@ the hybrid LibrePGP design:
 `-pub`/`-pubfile` flags mirror the public key handling used by `encrypt`.  The
 `kemunwrap` command likewise supports inline base64 or files via `-priv`/`-privfile`,
 `-wrapped`/`-wrappedfile`, and `-kemct`/`-kemctfile`.
+
+### Encrypt with a ML-KEM + X25519 composite key
+
+The PoC can emit and consume the LibrePGP §14 hybrid PKESK format.  The CLI
+expects a composite public/secret key packet that carries both the ECC share
+and the ML-KEM payload.  You can generate such a key pair with a short helper
+program using the exported builders:
+
+```bash
+cat <<'EOF' > hybrid_keygen.go
+package main
+
+import (
+  "crypto/rand"
+  "os"
+
+  "example.com/gocrypt/pkg/armor"
+  "example.com/gocrypt/pkg/crypto/kem/mlkem"
+  "example.com/gocrypt/pkg/pgp"
+  "github.com/cloudflare/circl/dh/x25519"
+)
+
+func main() {
+  var eccPriv x25519.Key
+  if _, err := rand.Read(eccPriv[:]); err != nil {
+    panic(err)
+  }
+  var eccPub x25519.Key
+  x25519.KeyGen(&eccPub, &eccPriv)
+
+  mlPub, mlPriv, err := mlkem.Generate("mlkem768")
+  if err != nil {
+    panic(err)
+  }
+
+  pubPkt, err := pgp.BuildCompositePublicKeyV6(pgp.PKALG_MLKEM768_X25519, eccPub[:], mlPub)
+  if err != nil {
+    panic(err)
+  }
+  secPkt, err := pgp.BuildCompositeSecretKeyV6(pgp.PKALG_MLKEM768_X25519, eccPub[:], eccPriv[:], mlPub, mlPriv)
+  if err != nil {
+    panic(err)
+  }
+
+  _ = os.MkdirAll("keys", 0o755)
+  if err := os.WriteFile("keys/hybrid.pub.asc", armor.ArmorEncode("PGP PUBLIC KEY BLOCK", pubPkt, nil), 0o644); err != nil {
+    panic(err)
+  }
+  if err := os.WriteFile("keys/hybrid.key.asc", armor.ArmorEncode("PGP PRIVATE KEY BLOCK", secPkt, nil), 0o600); err != nil {
+    panic(err)
+  }
+}
+EOF
+
+go run hybrid_keygen.go
+```
+
+After running the snippet you will have `keys/hybrid.pub.asc` and
+`keys/hybrid.key.asc` that the CLI can use directly:
+
+```bash
+echo 'hybrid hello' | ./gocrypt \
+  -format=librepgp \
+  -sym=aes256 \
+  -pubfile=keys/hybrid.pub.asc \
+  -out hybrid.msg
+
+./gocrypt decrypt \
+  -keyfile=keys/hybrid.key.asc \
+  -out hybrid.txt \
+  hybrid.msg
+```
+
+The same flow works for the ML-KEM1024+X448 combination—switch the snippet to
+use `mlkem.Generate("mlkem1024")` and the corresponding
+`pgp.PKALG_MLKEM1024_X448` constant when you want the higher security level.
 
 ## Notes
 

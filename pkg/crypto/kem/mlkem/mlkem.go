@@ -41,6 +41,46 @@ func hkdfLike(ss []byte, info []byte, n int) []byte {
 	return buf[:n]
 }
 
+// Encapsulate runs the underlying ML-KEM scheme and returns the ciphertext and
+// shared secret without any post-processing.
+func Encapsulate(name string, pub []byte) ([]byte, []byte, error) {
+	s, err := schemeByName(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	pk, err := s.UnmarshalBinaryPublicKey(pub)
+	if err != nil {
+		return nil, nil, err
+	}
+	ct, ss, err := s.Encapsulate(pk)
+	if err != nil {
+		return nil, nil, err
+	}
+	ssCopy := make([]byte, len(ss))
+	copy(ssCopy, ss)
+	return ct, ssCopy, nil
+}
+
+// DecapsulateShared recovers the ML-KEM shared secret for the given ciphertext
+// without applying the XOR wrapping used by Wrap/Unwrap.
+func DecapsulateShared(name string, priv []byte, ct []byte) ([]byte, error) {
+	s, err := schemeByName(name)
+	if err != nil {
+		return nil, err
+	}
+	sk, err := s.UnmarshalBinaryPrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	ss, err := s.Decapsulate(sk, ct)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, len(ss))
+	copy(out, ss)
+	return out, nil
+}
+
 // Wrap derives KEK from KEM shared secret and XOR-wraps CEK. Returns kemCT in third value.
 func Wrap(name string, pub []byte, cek []byte) (recipType string, wrapped, kemCT []byte, err error) {
 	s, err := schemeByName(name)
