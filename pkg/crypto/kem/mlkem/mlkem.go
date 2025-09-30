@@ -139,3 +139,22 @@ func Generate(name string) (pub, priv []byte, err error) {
 	bsk, _ := sk.MarshalBinary()
 	return bpk, bsk, nil
 }
+
+// PublicFromPrivate recovers the ML-KEM public key bytes corresponding to the
+// supplied private key.
+func PublicFromPrivate(name string, priv []byte) ([]byte, error) {
+	s, err := schemeByName(name)
+	if err != nil {
+		return nil, err
+	}
+	sk, err := s.UnmarshalBinaryPrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	pk := sk.Public()
+	bpk, err := pk.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	return bpk, nil
+}

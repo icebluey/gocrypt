@@ -72,6 +72,53 @@ func compositeSpecForAlgorithm(alg int) (compositeSpec, error) {
 	}
 }
 
+// CompositeKeySizes returns the expected byte lengths for the ECC and ML-KEM
+// components of the supported LibrePGP hybrid algorithms.
+func CompositeKeySizes(alg int) (eccLen, mlkemPubLen, mlkemPrivLen int, err error) {
+	spec, err := compositeSpecForAlgorithm(alg)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return spec.eccLen, spec.mlkemPubLen, spec.mlkemPrivLen, nil
+}
+
+// ComputeCompositeFingerprint deterministically derives the v6 fingerprint for
+// a composite ML-KEM + ECC public key using a fixed creation time of zero. This
+// allows callers that only possess the raw algorithm-specific material to
+// obtain a stable fingerprint suitable for LibrePGP hybrid PKESK processing.
+func ComputeCompositeFingerprint(alg int, eccPub, mlkemPub []byte) ([32]byte, error) {
+	var zero [32]byte
+	spec, err := compositeSpecForAlgorithm(alg)
+	if err != nil {
+		return zero, err
+	}
+	if len(eccPub) != spec.eccLen {
+		return zero, fmt.Errorf("pgp: ecc public key length %d mismatch (want %d)", len(eccPub), spec.eccLen)
+	}
+	if len(mlkemPub) != spec.mlkemPubLen {
+		return zero, fmt.Errorf("pgp: ml-kem public key length %d mismatch (want %d)", len(mlkemPub), spec.mlkemPubLen)
+	}
+
+	pubMatLen := 1 + len(spec.curveOID) + 1 + spec.eccLen + 4 + spec.mlkemPubLen
+	body := make([]byte, 0, 1+4+1+4+pubMatLen)
+	body = append(body, 6)
+	body = append(body, 0, 0, 0, 0) // fixed creation time for deterministic fingerprinting
+	body = append(body, byte(alg))
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(pubMatLen))
+	body = append(body, lenBuf[:]...)
+	body = append(body, byte(len(spec.curveOID)))
+	body = append(body, spec.curveOID...)
+	body = append(body, 0x40)
+	body = append(body, eccPub...)
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(spec.mlkemPubLen))
+	body = append(body, lenBuf[:]...)
+	body = append(body, mlkemPub...)
+
+	fp := computeV6Fingerprint(body)
+	return fp, nil
+}
+
 // BuildPublicKeyV6 builds a minimal v6 Public-Key (Tag 6) packet body for X25519/X448.
 // version(6) || created(4) || alg(1) || pubMatLen(4) || pubMat
 func BuildPublicKeyV6(alg int, pub []byte) ([]byte, error) {
