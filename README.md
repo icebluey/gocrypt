@@ -61,6 +61,34 @@ If you already have the raw base64 strings, the original `-pk=<BASE64>` flag is
 still available for both encryption (public key) and `decrypt` (private key);
 pass `-pkalg` to choose between X25519 and X448 in that mode.
 
+### Work with ML-KEM helper routines
+
+The CLI exposes experimental helpers that exercise the ML-KEM wrappers used by
+the hybrid LibrePGP design:
+
+```bash
+# Generate a ML-KEM-768 key pair (omit -out to print base64 to stdout)
+./gocrypt kemgen -scheme=mlkem768 -out kem/mlkem768
+
+# Wrap a freshly generated 32-byte CEK for that recipient
+./gocrypt kemwrap \
+  -scheme=mlkem768 \
+  -pubfile=kem/mlkem768.pub \
+  -ceksize=32
+
+# Recover the CEK from the base64 WRAPPED/KEMCT values printed above
+./gocrypt kemunwrap \
+  -scheme=mlkem768 \
+  -privfile=kem/mlkem768.key \
+  -wrapped="<WRAPPED from kemwrap>" \
+  -kemct="<KEMCT from kemwrap>"
+```
+
+`kemwrap` accepts `-cek` when you want to supply the CEK bytes yourself and the
+`-pub`/`-pubfile` flags mirror the public key handling used by `encrypt`.  The
+`kemunwrap` command likewise supports inline base64 or files via `-priv`/`-privfile`,
+`-wrapped`/`-wrappedfile`, and `-kemct`/`-kemctfile`.
+
 ## Notes
 
 - RFC 9580 references:
