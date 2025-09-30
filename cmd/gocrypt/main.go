@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"example.com/gocrypt/pkg/armor"
+	"example.com/gocrypt/pkg/crypto/kem/mlkem"
 	"example.com/gocrypt/pkg/pgp"
 
 	"github.com/cloudflare/circl/dh/x25519"
@@ -138,13 +139,24 @@ func loadPrivateKeyFromFile(path string) ([]byte, int, error) {
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "keygen" {
-		keygen(os.Args[2:])
-		return
-	}
-	if len(os.Args) > 1 && os.Args[1] == "decrypt" {
-		decrypt(os.Args[2:])
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "keygen":
+			keygen(os.Args[2:])
+			return
+		case "decrypt":
+			decrypt(os.Args[2:])
+			return
+		case "kemgen":
+			kemgen(os.Args[2:])
+			return
+		case "kemwrap":
+			kemwrap(os.Args[2:])
+			return
+		case "kemunwrap":
+			kemunwrap(os.Args[2:])
+			return
+		}
 	}
 	encrypt(os.Args[1:])
 }
@@ -437,6 +449,127 @@ func decrypt(args []string) {
 	if outFile != nil {
 		fatalIf(outFile.Close())
 	}
+}
+
+func kemgen(args []string) {
+	fs := flag.NewFlagSet("kemgen", flag.ExitOnError)
+	var scheme string
+	var out string
+	fs.StringVar(&scheme, "scheme", "mlkem768", "KEM scheme: mlkem768|mlkem1024")
+	fs.StringVar(&out, "out", "", "file prefix to write keys (*.pub / *.key)")
+	fatalIf(fs.Parse(args))
+
+	scheme = strings.ToLower(scheme)
+	pub, priv, err := mlkem.Generate(scheme)
+	fatalIf(err)
+	pubB64 := base64.StdEncoding.EncodeToString(pub)
+	privB64 := base64.StdEncoding.EncodeToString(priv)
+	if out == "" {
+		fmt.Printf("SCHEME=%s\nPUBLIC=%s\nPRIVATE=%s\n", scheme, pubB64, privB64)
+		return
+	}
+	writeKeyFiles(out, pubB64, privB64)
+}
+
+func kemwrap(args []string) {
+	fs := flag.NewFlagSet("kemwrap", flag.ExitOnError)
+	var scheme string
+	var pubB64 string
+	var pubFile string
+	var cekB64 string
+	var cekSize int
+	fs.StringVar(&scheme, "scheme", "mlkem768", "KEM scheme: mlkem768|mlkem1024")
+	fs.StringVar(&pubB64, "pub", "", "recipient ML-KEM public key (base64)")
+	fs.StringVar(&pubFile, "pubfile", "", "recipient ML-KEM public key file (base64)")
+	fs.StringVar(&cekB64, "cek", "", "content-encryption key (base64); if omitted, random bytes are generated")
+	fs.IntVar(&cekSize, "ceksize", 32, "random CEK length in bytes when -cek is omitted")
+	fatalIf(fs.Parse(args))
+
+	scheme = strings.ToLower(scheme)
+	pub, err := decodeBase64Input(pubB64, "-pub", pubFile, "-pubfile")
+	fatalIf(err)
+
+	var cek []byte
+	if cekB64 != "" {
+		cek, err = base64.StdEncoding.DecodeString(cekB64)
+		if err != nil {
+			fatalf("invalid -cek base64: %v", err)
+		}
+	} else {
+		if cekSize <= 0 {
+			fatalf("-ceksize must be positive")
+		}
+		cek = make([]byte, cekSize)
+		_, err = rand.Read(cek)
+		fatalIf(err)
+	}
+
+	recip, wrapped, kemCT, err := mlkem.Wrap(scheme, pub, cek)
+	fatalIf(err)
+	fmt.Printf("SCHEME=%s\nWRAPPED=%s\nKEMCT=%s\n", recip, base64.StdEncoding.EncodeToString(wrapped), base64.StdEncoding.EncodeToString(kemCT))
+	if cekB64 == "" {
+		fmt.Printf("CEK=%s\n", base64.StdEncoding.EncodeToString(cek))
+	}
+}
+
+func kemunwrap(args []string) {
+	fs := flag.NewFlagSet("kemunwrap", flag.ExitOnError)
+	var scheme string
+	var privB64 string
+	var privFile string
+	var wrappedB64 string
+	var wrappedFile string
+	var kemCTB64 string
+	var kemCTFile string
+	fs.StringVar(&scheme, "scheme", "mlkem768", "KEM scheme: mlkem768|mlkem1024")
+	fs.StringVar(&privB64, "priv", "", "recipient ML-KEM private key (base64)")
+	fs.StringVar(&privFile, "privfile", "", "recipient ML-KEM private key file (base64)")
+	fs.StringVar(&wrappedB64, "wrapped", "", "wrapped CEK bytes (base64)")
+	fs.StringVar(&wrappedFile, "wrappedfile", "", "wrapped CEK file (base64)")
+	fs.StringVar(&kemCTB64, "kemct", "", "ML-KEM ciphertext (base64)")
+	fs.StringVar(&kemCTFile, "kemctfile", "", "ML-KEM ciphertext file (base64)")
+	fatalIf(fs.Parse(args))
+
+	scheme = strings.ToLower(scheme)
+	priv, err := decodeBase64Input(privB64, "-priv", privFile, "-privfile")
+	fatalIf(err)
+	wrapped, err := decodeBase64Input(wrappedB64, "-wrapped", wrappedFile, "-wrappedfile")
+	fatalIf(err)
+	kemCT, err := decodeBase64Input(kemCTB64, "-kemct", kemCTFile, "-kemctfile")
+	fatalIf(err)
+
+	cek, err := mlkem.Unwrap(scheme, priv, wrapped, kemCT)
+	fatalIf(err)
+	fmt.Printf("CEK=%s\n", base64.StdEncoding.EncodeToString(cek))
+}
+
+func decodeBase64Input(inline string, inlineFlag string, file string, fileFlag string) ([]byte, error) {
+	if inline != "" && file != "" {
+		return nil, fmt.Errorf("use either %s or %s", inlineFlag, fileFlag)
+	}
+	if inline == "" && file == "" {
+		return nil, fmt.Errorf("missing %s or %s", inlineFlag, fileFlag)
+	}
+	if inline != "" {
+		b, err := base64.StdEncoding.DecodeString(inline)
+		if err != nil {
+			return nil, fmt.Errorf("invalid base64 for %s: %w", inlineFlag, err)
+		}
+		return b, nil
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil, err
+	}
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%s is empty", file)
+	}
+	b, err := base64.StdEncoding.DecodeString(string(data))
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64 in %s: %w", file, err)
+	}
+	return b, nil
 }
 
 func looksLikeArmor(r *bufio.Reader) bool {
