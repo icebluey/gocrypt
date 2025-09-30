@@ -42,8 +42,8 @@ echo 'hello' | ./gocrypt \
 
 `-pubfile` accepts either the armored output shown above or the raw base64
 (`keys/x448.pub`) produced when `-armor` is omitted. The tool automatically
-detects whether the key is X25519 or X448; use `-pkalg` only if you need to
-override detection.
+detects whether the key is X25519/X448 or one of the ML-KEM hybrids (1216 or
+1624 byte raw blobs); use `-pkalg` only if you need to override detection.
 
 ### Decrypt using the matching private key
 
@@ -55,12 +55,16 @@ override detection.
 ```
 
 `-keyfile` mirrors `-pubfile` and supports `.key.asc` as well as the raw
-`keys/x448.key` file. The command writes the decrypted message to `stdout` when
-`-out` is omitted.
+`keys/x448.key` file (including 2432/3224 byte ML-KEM hybrid dumps). The
+command writes the decrypted message to `stdout` when `-out` is omitted.
 
 If you already have the raw base64 strings, the original `-pk=<BASE64>` flag is
-still available for both encryption (public key) and `decrypt` (private key);
-pass `-pkalg` to choose between X25519 and X448 in that mode.
+still available for both encryption (public key) and `decrypt` (private key).
+Supply the 32- or 56-byte ECC share for X25519/X448, or concatenate it with the
+ML-KEM payload (32+1184 or 56+1568 bytes for the public key; 32+2400 or
+56+3168 bytes for the private key) when working with the hybrid algorithms, and
+confirm the choice with `-pkalg=mlkem768+x25519` or `-pkalg=mlkem1024+x448`.
+The `gocrypt hybrid` helper shown below performs this concatenation for you.
 
 ### Work with ML-KEM helper routines
 
@@ -92,13 +96,89 @@ the hybrid LibrePGP design:
 
 ### Encrypt with a ML-KEM + X25519 composite key
 
-The PoC can emit and consume the LibrePGP §14 hybrid PKESK format.  The CLI
-expects a composite public/secret key packet that carries both the ECC share
-and the ML-KEM payload.  You can generate such a key pair with a short helper
-program using the exported builders:
+The PoC can emit and consume the LibrePGP §14 hybrid PKESK format.  The CLI now
+accepts both full Tag 6/Tag 5 packets **and** the raw hybrid blobs described
+above, so you can mix and match depending on your workflow.  Generate the raw
+X25519/X448 and ML-KEM material (for example via `keygen` and `kemgen`), then use
+`gocrypt hybrid` to merge the byte slices into the base64 blobs expected by
+`-pk`/`-pkalg` and `decrypt -pk`.
 
-After running the snippet you will have `keys/hybrid.pub.asc` and
-`keys/hybrid.key.asc` that the CLI can use directly:
+#### Example: ML-KEM768 + X25519 via raw base64
+
+```bash
+# 1. produce the ECC and ML-KEM material
+./gocrypt keygen -pkalg=x25519 -out keys/mlkem768_x25519
+./gocrypt kemgen -scheme=mlkem768 -out kem/mlkem768
+
+# 2. combine the ECC and ML-KEM shares with the CLI helper
+./gocrypt hybrid \
+  -mode=pub \
+  -eccfile=keys/mlkem768_x25519.pub \
+  -mlkemfile=kem/mlkem768.pub \
+  -out keys/mlkem768_x25519_hybrid.pub
+./gocrypt hybrid \
+  -mode=priv \
+  -eccfile=keys/mlkem768_x25519.key \
+  -mlkemfile=kem/mlkem768.key \
+  -out keys/mlkem768_x25519_hybrid.key
+PUB=$(tr -d '\n' < keys/mlkem768_x25519_hybrid.pub)
+PRIV=$(tr -d '\n' < keys/mlkem768_x25519_hybrid.key)
+
+# 3. encrypt with the hybrid algorithm (1216-byte public material)
+echo 'mlkem768 hybrid hello' | ./gocrypt \
+  -format=librepgp \
+  -sym=aes256 \
+  -pk="$PUB" \
+  -pkalg=mlkem768+x25519 \
+  -out hybrid768.msg
+
+# 4. decrypt using the matching composite private key (2432 bytes)
+./gocrypt decrypt \
+  -pk="$PRIV" \
+  -pkalg=mlkem768+x25519 \
+  -out hybrid768.txt \
+  hybrid768.msg
+```
+
+#### Example: ML-KEM1024 + X448 via raw base64
+
+```bash
+./gocrypt keygen -pkalg=x448 -out keys/mlkem1024_x448
+./gocrypt kemgen -scheme=mlkem1024 -out kem/mlkem1024
+
+./gocrypt hybrid \
+  -mode=pub \
+  -eccfile=keys/mlkem1024_x448.pub \
+  -mlkemfile=kem/mlkem1024.pub \
+  -out keys/mlkem1024_x448_hybrid.pub
+./gocrypt hybrid \
+  -mode=priv \
+  -eccfile=keys/mlkem1024_x448.key \
+  -mlkemfile=kem/mlkem1024.key \
+  -out keys/mlkem1024_x448_hybrid.key
+
+PUB=$(tr -d '\n' < keys/mlkem1024_x448_hybrid.pub)
+PRIV=$(tr -d '\n' < keys/mlkem1024_x448_hybrid.key)
+
+echo 'mlkem1024 hybrid hello' | ./gocrypt \
+  -format=librepgp \
+  -sym=aes256 \
+  -pk="$PUB" \
+  -pkalg=mlkem1024+x448 \
+  -out hybrid1024.msg
+
+./gocrypt decrypt \
+  -pk="$PRIV" \
+  -pkalg=mlkem1024+x448 \
+  -out hybrid1024.txt \
+  hybrid1024.msg
+```
+
+#### Using armored hybrid key packets
+
+You can still build OpenPGP packets with the helper builders when you want
+armored key material. After running the snippet you will have
+`keys/hybrid.pub.asc` and `keys/hybrid.key.asc` that the CLI can use directly:
 
 ```bash
 echo 'hybrid hello' | ./gocrypt \

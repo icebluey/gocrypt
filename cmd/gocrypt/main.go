@@ -72,6 +72,79 @@ func pkAlgName(alg int) string {
 	}
 }
 
+func mlkemSchemeForAlg(alg int) (string, error) {
+	switch alg {
+	case pgp.PKALG_MLKEM768_X25519:
+		return "mlkem768", nil
+	case pgp.PKALG_MLKEM1024_X448:
+		return "mlkem1024", nil
+	default:
+		return "", fmt.Errorf("unsupported composite algorithm %d", alg)
+	}
+}
+
+func buildCompositeSecretFromRaw(alg int, eccPrivRaw, mlkemPriv []byte) (*pgp.SecretKey, error) {
+	eccLen, mlkemPubLen, mlkemPrivLen, err := pgp.CompositeKeySizes(alg)
+	if err != nil {
+		return nil, err
+	}
+	if len(eccPrivRaw) != eccLen {
+		return nil, fmt.Errorf("ecc private key length %d mismatch (want %d)", len(eccPrivRaw), eccLen)
+	}
+	if len(mlkemPriv) != mlkemPrivLen {
+		return nil, fmt.Errorf("ml-kem private key length %d mismatch (want %d)", len(mlkemPriv), mlkemPrivLen)
+	}
+
+	var eccPriv []byte
+	var eccPub []byte
+	switch alg {
+	case pgp.PKALG_MLKEM768_X25519:
+		var priv x25519.Key
+		copy(priv[:], eccPrivRaw)
+		var pub x25519.Key
+		x25519.KeyGen(&pub, &priv)
+		eccPriv = append([]byte(nil), priv[:]...)
+		eccPub = append([]byte(nil), pub[:]...)
+	case pgp.PKALG_MLKEM1024_X448:
+		var priv x448.Key
+		copy(priv[:], eccPrivRaw)
+		var pub x448.Key
+		x448.KeyGen(&pub, &priv)
+		eccPriv = append([]byte(nil), priv[:]...)
+		eccPub = append([]byte(nil), pub[:]...)
+	default:
+		return nil, fmt.Errorf("unsupported composite algorithm %d", alg)
+	}
+
+	scheme, err := mlkemSchemeForAlg(alg)
+	if err != nil {
+		return nil, err
+	}
+	mlkemPub, err := mlkem.PublicFromPrivate(scheme, mlkemPriv)
+	if err != nil {
+		return nil, err
+	}
+	if len(mlkemPub) != mlkemPubLen {
+		return nil, fmt.Errorf("ml-kem public key length %d mismatch (want %d)", len(mlkemPub), mlkemPubLen)
+	}
+
+	fp, err := pgp.ComputeCompositeFingerprint(alg, eccPub, mlkemPub)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pgp.SecretKey{
+		PublicKey: pgp.PublicKey{
+			Algorithm:   alg,
+			Fingerprint: fp,
+			ECCPublic:   eccPub,
+			MLKEMPublic: append([]byte(nil), mlkemPub...),
+		},
+		ECCPrivate:   eccPriv,
+		MLKEMPrivate: append([]byte(nil), mlkemPriv...),
+	}, nil
+}
+
 func loadPublicKeyFromFile(path string) (*pgp.PublicKey, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -99,11 +172,34 @@ func loadPublicKeyFromFile(path string) (*pgp.PublicKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid public key encoding in %s: %w", path, err)
 	}
+	if len(decoded) > 0 && (decoded[0]&0xC0) == 0xC0 {
+		pk, err := pgp.ParsePublicKeyV6(decoded)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Tag 6 public key in %s: %w", path, err)
+		}
+		return pk, nil
+	}
 	switch len(decoded) {
 	case 32:
 		return &pgp.PublicKey{Algorithm: pgp.PKALG_X25519, ECCPublic: append([]byte(nil), decoded...)}, nil
 	case 56:
 		return &pgp.PublicKey{Algorithm: pgp.PKALG_X448, ECCPublic: append([]byte(nil), decoded...)}, nil
+	case 32 + 1184:
+		ecc := append([]byte(nil), decoded[:32]...)
+		mlkem := append([]byte(nil), decoded[32:]...)
+		fp, err := pgp.ComputeCompositeFingerprint(pgp.PKALG_MLKEM768_X25519, ecc, mlkem)
+		if err != nil {
+			return nil, err
+		}
+		return &pgp.PublicKey{Algorithm: pgp.PKALG_MLKEM768_X25519, ECCPublic: ecc, MLKEMPublic: mlkem, Fingerprint: fp}, nil
+	case 56 + 1568:
+		ecc := append([]byte(nil), decoded[:56]...)
+		mlkem := append([]byte(nil), decoded[56:]...)
+		fp, err := pgp.ComputeCompositeFingerprint(pgp.PKALG_MLKEM1024_X448, ecc, mlkem)
+		if err != nil {
+			return nil, err
+		}
+		return &pgp.PublicKey{Algorithm: pgp.PKALG_MLKEM1024_X448, ECCPublic: ecc, MLKEMPublic: mlkem, Fingerprint: fp}, nil
 	default:
 		return nil, fmt.Errorf("public key length %d in %s not recognized", len(decoded), path)
 	}
@@ -136,11 +232,22 @@ func loadPrivateKeyFromFile(path string) (*pgp.SecretKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid private key encoding in %s: %w", path, err)
 	}
+	if len(decoded) > 0 && (decoded[0]&0xC0) == 0xC0 {
+		sk, err := pgp.ParseSecretKeyV6(decoded)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Tag 5 private key in %s: %w", path, err)
+		}
+		return sk, nil
+	}
 	switch len(decoded) {
 	case 32:
 		return &pgp.SecretKey{PublicKey: pgp.PublicKey{Algorithm: pgp.PKALG_X25519}, ECCPrivate: append([]byte(nil), decoded...)}, nil
 	case 56:
 		return &pgp.SecretKey{PublicKey: pgp.PublicKey{Algorithm: pgp.PKALG_X448}, ECCPrivate: append([]byte(nil), decoded...)}, nil
+	case 32 + 2400:
+		return buildCompositeSecretFromRaw(pgp.PKALG_MLKEM768_X25519, decoded[:32], decoded[32:])
+	case 56 + 3168:
+		return buildCompositeSecretFromRaw(pgp.PKALG_MLKEM1024_X448, decoded[:56], decoded[56:])
 	default:
 		return nil, fmt.Errorf("private key length %d in %s not recognized", len(decoded), path)
 	}
@@ -164,6 +271,9 @@ func main() {
 		case "kemunwrap":
 			kemunwrap(os.Args[2:])
 			return
+		case "hybrid":
+			hybrid(os.Args[2:])
+			return
 		}
 	}
 	encrypt(os.Args[1:])
@@ -183,8 +293,8 @@ func encrypt(args []string) {
 	fs.StringVar(&format, "format", "rfc9580", "container format: rfc9580|librepgp")
 	fs.StringVar(&sym, "sym", "aes256", "symmetric: aes128|aes192|aes256")
 	fs.Var(&pkalg, "pkalg", "recipient alg: x25519|x448|mlkem768+x25519|mlkem1024+x448 (used with -pk or to override autodetect)")
-	fs.StringVar(&pkb64, "pk", "", "recipient public key (raw) base64")
-	fs.StringVar(&pubFile, "pubfile", "", "recipient public key file (.pub|.pub.asc)")
+	fs.StringVar(&pkb64, "pk", "", "recipient public key (raw base64; use 'gocrypt hybrid -mode=pub' for ML-KEM composites)")
+	fs.StringVar(&pubFile, "pubfile", "", "recipient public key file (.pub|.pub.asc|raw hybrid base64)")
 	fs.StringVar(&outPath, "out", "", "output file (default: stdout)")
 	fatalIf(fs.Parse(args))
 
@@ -223,13 +333,25 @@ func encrypt(args []string) {
 		decoded, err := base64.StdEncoding.DecodeString(pkb64)
 		fatalIf(err)
 		var algGuess int
+		var eccPub []byte
+		var mlkemPub []byte
 		switch len(decoded) {
 		case 32:
 			algGuess = pgp.PKALG_X25519
+			eccPub = append([]byte(nil), decoded...)
 		case 56:
 			algGuess = pgp.PKALG_X448
+			eccPub = append([]byte(nil), decoded...)
+		case 32 + 1184:
+			algGuess = pgp.PKALG_MLKEM768_X25519
+			eccPub = append([]byte(nil), decoded[:32]...)
+			mlkemPub = append([]byte(nil), decoded[32:]...)
+		case 56 + 1568:
+			algGuess = pgp.PKALG_MLKEM1024_X448
+			eccPub = append([]byte(nil), decoded[:56]...)
+			mlkemPub = append([]byte(nil), decoded[56:]...)
 		default:
-			fatalf("raw -pk must be 32-byte X25519 or 56-byte X448 public key")
+			fatalf("raw -pk length %d is not recognized (expect 32, 56, 1216 or 1624 bytes)", len(decoded))
 		}
 		if pkalg.set {
 			want, err := parsePKAlg(pkalg.value)
@@ -239,10 +361,13 @@ func encrypt(args []string) {
 			}
 			algGuess = want
 		}
-		if algGuess != pgp.PKALG_X25519 && algGuess != pgp.PKALG_X448 {
-			fatalf("-pk only supports raw X25519/X448 keys; use -pubfile for composite algorithms")
+		recipient = &pgp.PublicKey{Algorithm: algGuess, ECCPublic: eccPub}
+		if len(mlkemPub) > 0 {
+			recipient.MLKEMPublic = mlkemPub
+			fp, err := pgp.ComputeCompositeFingerprint(algGuess, eccPub, mlkemPub)
+			fatalIf(err)
+			recipient.Fingerprint = fp
 		}
-		recipient = &pgp.PublicKey{Algorithm: algGuess, ECCPublic: append([]byte(nil), decoded...)}
 	} else {
 		recipient, err = loadPublicKeyFromFile(pubFile)
 		fatalIf(err)
@@ -365,8 +490,8 @@ func decrypt(args []string) {
 	pkalg.value = "x448"
 	fs.StringVar(new(string), "format", "rfc9580", "container format")
 	fs.Var(&pkalg, "pkalg", "recipient alg: x25519|x448|mlkem768+x25519|mlkem1024+x448 (used with -pk or to override autodetect)")
-	fs.StringVar(&pkb64, "pk", "", "recipient private key (raw) base64")
-	fs.StringVar(&keyFile, "keyfile", "", "recipient private key file (.key|.key.asc)")
+	fs.StringVar(&pkb64, "pk", "", "recipient private key (raw base64; use 'gocrypt hybrid -mode=priv' for ML-KEM composites)")
+	fs.StringVar(&keyFile, "keyfile", "", "recipient private key file (.key|.key.asc|raw hybrid base64)")
 	fs.StringVar(&outPath, "out", "", "output file (default: stdout)")
 	fatalIf(fs.Parse(args))
 
@@ -412,13 +537,25 @@ func decrypt(args []string) {
 		decoded, err := base64.StdEncoding.DecodeString(pkb64)
 		fatalIf(err)
 		var algGuess int
+		var eccPriv []byte
+		var mlkemPriv []byte
 		switch len(decoded) {
 		case 32:
 			algGuess = pgp.PKALG_X25519
+			eccPriv = append([]byte(nil), decoded...)
 		case 56:
 			algGuess = pgp.PKALG_X448
+			eccPriv = append([]byte(nil), decoded...)
+		case 32 + 2400:
+			algGuess = pgp.PKALG_MLKEM768_X25519
+			eccPriv = append([]byte(nil), decoded[:32]...)
+			mlkemPriv = append([]byte(nil), decoded[32:]...)
+		case 56 + 3168:
+			algGuess = pgp.PKALG_MLKEM1024_X448
+			eccPriv = append([]byte(nil), decoded[:56]...)
+			mlkemPriv = append([]byte(nil), decoded[56:]...)
 		default:
-			fatalf("raw -pk must be 32-byte X25519 or 56-byte X448 private key")
+			fatalf("raw -pk length %d is not recognized (expect 32, 56, 2432 or 3224 bytes)", len(decoded))
 		}
 		if pkalg.set {
 			want, err := parsePKAlg(pkalg.value)
@@ -428,10 +565,12 @@ func decrypt(args []string) {
 			}
 			algGuess = want
 		}
-		if algGuess != pgp.PKALG_X25519 && algGuess != pgp.PKALG_X448 {
-			fatalf("-pk only supports raw X25519/X448 keys; use -keyfile for composite algorithms")
+		if len(mlkemPriv) > 0 {
+			secret, err = buildCompositeSecretFromRaw(algGuess, eccPriv, mlkemPriv)
+			fatalIf(err)
+		} else {
+			secret = &pgp.SecretKey{PublicKey: pgp.PublicKey{Algorithm: algGuess}, ECCPrivate: eccPriv}
 		}
-		secret = &pgp.SecretKey{PublicKey: pgp.PublicKey{Algorithm: algGuess}, ECCPrivate: append([]byte(nil), decoded...)}
 	} else {
 		secret, err = loadPrivateKeyFromFile(keyFile)
 		fatalIf(err)
@@ -594,6 +733,65 @@ func kemunwrap(args []string) {
 	cek, err := mlkem.Unwrap(scheme, priv, wrapped, kemCT)
 	fatalIf(err)
 	fmt.Printf("CEK=%s\n", base64.StdEncoding.EncodeToString(cek))
+}
+
+func hybrid(args []string) {
+	fs := flag.NewFlagSet("hybrid", flag.ExitOnError)
+	mode := fs.String("mode", "pub", "combine ECC and ML-KEM material: pub|priv")
+	var eccB64 string
+	var eccFile string
+	var mlkemB64 string
+	var mlkemFile string
+	var outPath string
+	fs.StringVar(&eccB64, "ecc", "", "ECC key material (base64)")
+	fs.StringVar(&eccFile, "eccfile", "", "ECC key material file (base64)")
+	fs.StringVar(&mlkemB64, "mlkem", "", "ML-KEM key material (base64)")
+	fs.StringVar(&mlkemFile, "mlkemfile", "", "ML-KEM key material file (base64)")
+	fs.StringVar(&outPath, "out", "", "output file for composite base64 (default: stdout)")
+	fatalIf(fs.Parse(args))
+
+	ecc, err := decodeBase64Input(eccB64, "-ecc", eccFile, "-eccfile")
+	fatalIf(err)
+	mlkem, err := decodeBase64Input(mlkemB64, "-mlkem", mlkemFile, "-mlkemfile")
+	fatalIf(err)
+
+	switch strings.ToLower(*mode) {
+	case "pub":
+		switch {
+		case len(ecc) == 32 && len(mlkem) == 1184:
+		// ok
+		case len(ecc) == 56 && len(mlkem) == 1568:
+		// ok
+		default:
+			fatalf("unsupported public combination: ecc=%d mlkem=%d", len(ecc), len(mlkem))
+		}
+	case "priv":
+		switch {
+		case len(ecc) == 32 && len(mlkem) == 2400:
+		// ok
+		case len(ecc) == 56 && len(mlkem) == 3168:
+		// ok
+		default:
+			fatalf("unsupported private combination: ecc=%d mlkem=%d", len(ecc), len(mlkem))
+		}
+	default:
+		fatalf("unsupported -mode %q (want pub or priv)", *mode)
+	}
+
+	combined := append(append([]byte(nil), ecc...), mlkem...)
+	encoded := base64.StdEncoding.EncodeToString(combined)
+	if outPath == "" {
+		fmt.Println(encoded)
+		return
+	}
+	perm := os.FileMode(0o644)
+	if strings.ToLower(*mode) == "priv" {
+		perm = 0o600
+	}
+	if dir := filepath.Dir(outPath); dir != "." {
+		fatalIf(os.MkdirAll(dir, 0o755))
+	}
+	fatalIf(os.WriteFile(outPath, []byte(encoded+"\n"), perm))
 }
 
 func decodeBase64Input(inline string, inlineFlag string, file string, fileFlag string) ([]byte, error) {
