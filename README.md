@@ -97,55 +97,6 @@ expects a composite public/secret key packet that carries both the ECC share
 and the ML-KEM payload.  You can generate such a key pair with a short helper
 program using the exported builders:
 
-```bash
-cat <<'EOF' > hybrid_keygen.go
-package main
-
-import (
-  "crypto/rand"
-  "os"
-
-  "example.com/gocrypt/pkg/armor"
-  "example.com/gocrypt/pkg/crypto/kem/mlkem"
-  "example.com/gocrypt/pkg/pgp"
-  "github.com/cloudflare/circl/dh/x25519"
-)
-
-func main() {
-  var eccPriv x25519.Key
-  if _, err := rand.Read(eccPriv[:]); err != nil {
-    panic(err)
-  }
-  var eccPub x25519.Key
-  x25519.KeyGen(&eccPub, &eccPriv)
-
-  mlPub, mlPriv, err := mlkem.Generate("mlkem768")
-  if err != nil {
-    panic(err)
-  }
-
-  pubPkt, err := pgp.BuildCompositePublicKeyV6(pgp.PKALG_MLKEM768_X25519, eccPub[:], mlPub)
-  if err != nil {
-    panic(err)
-  }
-  secPkt, err := pgp.BuildCompositeSecretKeyV6(pgp.PKALG_MLKEM768_X25519, eccPub[:], eccPriv[:], mlPub, mlPriv)
-  if err != nil {
-    panic(err)
-  }
-
-  _ = os.MkdirAll("keys", 0o755)
-  if err := os.WriteFile("keys/hybrid.pub.asc", armor.ArmorEncode("PGP PUBLIC KEY BLOCK", pubPkt, nil), 0o644); err != nil {
-    panic(err)
-  }
-  if err := os.WriteFile("keys/hybrid.key.asc", armor.ArmorEncode("PGP PRIVATE KEY BLOCK", secPkt, nil), 0o600); err != nil {
-    panic(err)
-  }
-}
-EOF
-
-go run hybrid_keygen.go
-```
-
 After running the snippet you will have `keys/hybrid.pub.asc` and
 `keys/hybrid.key.asc` that the CLI can use directly:
 
