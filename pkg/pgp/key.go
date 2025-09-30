@@ -5,15 +5,72 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"crypto/sha256"
 )
 
-// Algorithm IDs (RFC 9580 / IANA OpenPGP registry)
+// Algorithm IDs (RFC 9580 / IANA OpenPGP registry and LibrePGP §14 composites)
 const (
-	PKALG_RSA    = 1
-	PKALG_ECDH   = 18
-	PKALG_X25519 = 25
-	PKALG_X448   = 26
+	PKALG_RSA             = 1
+	PKALG_ECDH            = 18
+	PKALG_X25519          = 25
+	PKALG_X448            = 26
+	PKALG_MLKEM768_X25519 = 29
+	PKALG_MLKEM1024_X448  = 30
+	PKALG_MLKEM768_P256   = 31
+	PKALG_MLKEM1024_P384  = 32
+	PKALG_MLKEM768_BP256  = 33
+	PKALG_MLKEM1024_BP384 = 34
 )
+
+// PublicKey describes the algorithm-specific material extracted from a v6
+// Public-Key packet.  Composite schemes carry both an ECC point and an ML-KEM
+// public key along with the key fingerprint required by LibrePGP §14.
+type PublicKey struct {
+	Algorithm   int
+	Fingerprint [32]byte
+	ECCPublic   []byte
+	MLKEMPublic []byte
+}
+
+// SecretKey describes the key material extracted from a v6 Secret-Key packet.
+// It embeds the public key information and adds the ECC and ML-KEM secrets when
+// present.
+type SecretKey struct {
+	PublicKey
+	ECCPrivate   []byte
+	MLKEMPrivate []byte
+}
+
+type compositeSpec struct {
+	curveOID     []byte
+	eccLen       int
+	mlkemPubLen  int
+	mlkemPrivLen int
+}
+
+func compositeSpecForAlgorithm(alg int) (compositeSpec, error) {
+	switch alg {
+	case PKALG_MLKEM768_X25519:
+		return compositeSpec{
+			curveOID:     []byte{0x2B, 0x65, 0x6E}, // 1.3.101.110 (Curve25519 alternative OID)
+			eccLen:       32,
+			mlkemPubLen:  1184,
+			mlkemPrivLen: 2400,
+		}, nil
+	case PKALG_MLKEM1024_X448:
+		return compositeSpec{
+			curveOID:     []byte{0x2B, 0x65, 0x6F}, // 1.3.101.111 (X448)
+			eccLen:       56,
+			mlkemPubLen:  1568,
+			mlkemPrivLen: 3168,
+		}, nil
+	case PKALG_MLKEM768_P256, PKALG_MLKEM1024_P384, PKALG_MLKEM768_BP256, PKALG_MLKEM1024_BP384:
+		return compositeSpec{}, fmt.Errorf("pgp: composite algorithm %d not implemented", alg)
+	default:
+		return compositeSpec{}, fmt.Errorf("pgp: unsupported composite algorithm %d", alg)
+	}
+}
 
 // BuildPublicKeyV6 builds a minimal v6 Public-Key (Tag 6) packet body for X25519/X448.
 // version(6) || created(4) || alg(1) || pubMatLen(4) || pubMat
@@ -77,89 +134,272 @@ func BuildSecretKeyV6(alg int, pub, priv []byte) ([]byte, error) {
 	return Packet(5, body), nil
 }
 
-// ParsePublicKeyV6 extracts the algorithm identifier and raw public key bytes from a
-// minimal v6 Public-Key (Tag 6) packet produced by BuildPublicKeyV6 or equivalent.
-func ParsePublicKeyV6(pkt []byte) (int, []byte, error) {
-	tag, body, rest, err := ReadPacket(pkt)
+// BuildCompositePublicKeyV6 builds a minimal v6 Public-Key packet for the
+// LibrePGP ML-KEM + ECC composite algorithms supported by this PoC.
+func BuildCompositePublicKeyV6(alg int, eccPub, mlkemPub []byte) ([]byte, error) {
+	spec, err := compositeSpecForAlgorithm(alg)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
-	if len(rest) != 0 {
-		return 0, nil, errors.New("pgp: unexpected extra data after public key packet")
+	if len(eccPub) != spec.eccLen {
+		return nil, fmt.Errorf("ecc pub length %d mismatch (want %d)", len(eccPub), spec.eccLen)
 	}
-	if tag != 6 {
-		return 0, nil, errors.New("pgp: packet is not Tag 6 public key")
+	if len(mlkemPub) != spec.mlkemPubLen {
+		return nil, fmt.Errorf("ml-kem pub length %d mismatch (want %d)", len(mlkemPub), spec.mlkemPubLen)
 	}
+	pubMatLen := 1 + len(spec.curveOID) + 1 + spec.eccLen + 4 + len(mlkemPub)
+	b := make([]byte, 0, 1+4+1+4+pubMatLen)
+	b = append(b, 6)
+	var t [4]byte
+	binary.BigEndian.PutUint32(t[:], uint32(time.Now().Unix()))
+	b = append(b, t[:]...)
+	b = append(b, byte(alg))
+	binary.BigEndian.PutUint32(t[:], uint32(pubMatLen))
+	b = append(b, t[:]...)
+	b = append(b, byte(len(spec.curveOID)))
+	b = append(b, spec.curveOID...)
+	b = append(b, 0x40)
+	b = append(b, eccPub...)
+	binary.BigEndian.PutUint32(t[:], uint32(len(mlkemPub)))
+	b = append(b, t[:]...)
+	b = append(b, mlkemPub...)
+	return Packet(6, b), nil
+}
+
+// BuildCompositeSecretKeyV6 emits a minimal v6 Secret-Key packet for composite
+// algorithms with S2K usage 0 (unencrypted secret data).
+func BuildCompositeSecretKeyV6(alg int, eccPub, eccPriv, mlkemPub, mlkemPriv []byte) ([]byte, error) {
+	spec, err := compositeSpecForAlgorithm(alg)
+	if err != nil {
+		return nil, err
+	}
+	if len(eccPriv) != spec.eccLen {
+		return nil, fmt.Errorf("ecc priv length %d mismatch (want %d)", len(eccPriv), spec.eccLen)
+	}
+	if len(mlkemPriv) != spec.mlkemPrivLen {
+		return nil, fmt.Errorf("ml-kem priv length %d mismatch (want %d)", len(mlkemPriv), spec.mlkemPrivLen)
+	}
+	pubPkt, err := BuildCompositePublicKeyV6(alg, eccPub, mlkemPub)
+	if err != nil {
+		return nil, err
+	}
+	_, pubBody, _, err := ReadPacket(pubPkt)
+	if err != nil {
+		return nil, err
+	}
+	body := make([]byte, 0, len(pubBody)+1+1+spec.eccLen+4+len(mlkemPriv))
+	body = append(body, pubBody...)
+	body = append(body, 0) // s2k usage octet = 0 (no protection)
+	body = append(body, 0x40)
+	body = append(body, eccPriv...)
+	var t [4]byte
+	binary.BigEndian.PutUint32(t[:], uint32(len(mlkemPriv)))
+	body = append(body, t[:]...)
+	body = append(body, mlkemPriv...)
+	return Packet(5, body), nil
+}
+
+func computeV6Fingerprint(body []byte) [32]byte {
+	// The fingerprint is SHA2-256 over 0x9B || len(body) || body
+	h := sha256.New()
+	h.Write([]byte{0x9B})
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len(body)))
+	h.Write(l[:])
+	h.Write(body)
+	var fp [32]byte
+	copy(fp[:], h.Sum(nil))
+	return fp
+}
+
+func parseCompositePublic(mat []byte, alg int, spec compositeSpec) (*PublicKey, error) {
+	if len(mat) < 1 {
+		return nil, errors.New("pgp: composite public key missing curve OID length")
+	}
+	curveLen := int(mat[0])
+	if curveLen == 0 || curveLen == 0xFF {
+		return nil, errors.New("pgp: composite public key invalid curve length")
+	}
+	if len(mat) < 1+curveLen {
+		return nil, errors.New("pgp: composite public key truncated curve OID")
+	}
+	curveOID := mat[1 : 1+curveLen]
+	if len(spec.curveOID) != 0 && !equalBytes(curveOID, spec.curveOID) {
+		return nil, fmt.Errorf("pgp: unexpected curve OID %x for alg %d", curveOID, alg)
+	}
+	rest := mat[1+curveLen:]
+	eccSize := spec.eccLen + 1 // SOS prefix 0x40 + coordinate
+	if len(rest) < eccSize {
+		return nil, errors.New("pgp: composite public key truncated ECC point")
+	}
+	eccSOS := rest[:eccSize]
+	if eccSOS[0] != 0x40 {
+		return nil, errors.New("pgp: composite public key missing SOS prefix")
+	}
+	eccPub := append([]byte(nil), eccSOS[1:]...)
+	rest = rest[eccSize:]
+	if len(rest) < 4 {
+		return nil, errors.New("pgp: composite public key missing ML-KEM length")
+	}
+	mlkemLen := int(binary.BigEndian.Uint32(rest[:4]))
+	rest = rest[4:]
+	if mlkemLen != len(rest) {
+		return nil, errors.New("pgp: composite public key ML-KEM length mismatch")
+	}
+	if mlkemLen != spec.mlkemPubLen {
+		return nil, fmt.Errorf("pgp: composite public key expected ML-KEM len %d got %d", spec.mlkemPubLen, mlkemLen)
+	}
+	mlkemPub := append([]byte(nil), rest...)
+	return &PublicKey{Algorithm: alg, ECCPublic: eccPub, MLKEMPublic: mlkemPub}, nil
+}
+
+func equalBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func parsePublicKeyBody(body []byte) (*PublicKey, int, error) {
 	if len(body) < 1+4+1+4 {
-		return 0, nil, errors.New("pgp: public key body too short")
+		return nil, 0, errors.New("pgp: public key body too short")
 	}
 	if body[0] != 6 {
-		return 0, nil, errors.New("pgp: unsupported public key version")
+		return nil, 0, errors.New("pgp: unsupported public key version")
 	}
 	alg := int(body[1+4])
 	pubLen := int(binary.BigEndian.Uint32(body[1+4+1 : 1+4+1+4]))
 	off := 1 + 4 + 1 + 4
 	if len(body) < off+pubLen {
-		return 0, nil, errors.New("pgp: truncated public key material")
+		return nil, 0, errors.New("pgp: truncated public key material")
 	}
-	pub := body[off : off+pubLen]
+	mat := body[off : off+pubLen]
+	var pk *PublicKey
 	switch alg {
 	case PKALG_X25519:
-		if len(pub) != 32 {
-			return 0, nil, fmt.Errorf("pgp: expected 32 byte X25519 key, got %d", len(pub))
+		if len(mat) != 32 {
+			return nil, 0, fmt.Errorf("pgp: expected 32 byte X25519 key, got %d", len(mat))
 		}
+		pk = &PublicKey{Algorithm: alg, ECCPublic: append([]byte(nil), mat...)}
 	case PKALG_X448:
-		if len(pub) != 56 {
-			return 0, nil, fmt.Errorf("pgp: expected 56 byte X448 key, got %d", len(pub))
+		if len(mat) != 56 {
+			return nil, 0, fmt.Errorf("pgp: expected 56 byte X448 key, got %d", len(mat))
+		}
+		pk = &PublicKey{Algorithm: alg, ECCPublic: append([]byte(nil), mat...)}
+	case PKALG_MLKEM768_X25519, PKALG_MLKEM1024_X448:
+		spec, err := compositeSpecForAlgorithm(alg)
+		if err != nil {
+			return nil, 0, err
+		}
+		var errParse error
+		pk, errParse = parseCompositePublic(mat, alg, spec)
+		if errParse != nil {
+			return nil, 0, errParse
 		}
 	default:
-		return 0, nil, fmt.Errorf("pgp: unsupported public key algorithm %d", alg)
+		return nil, 0, fmt.Errorf("pgp: unsupported public key algorithm %d", alg)
 	}
-	return alg, pub, nil
+	pk.Fingerprint = computeV6Fingerprint(body[:off+pubLen])
+	return pk, off + pubLen, nil
 }
 
-// ParseSecretKeyV6 extracts the algorithm identifier, public key bytes, and secret key
-// bytes from a minimal v6 Secret-Key (Tag 5) packet produced by BuildSecretKeyV6 or equivalent.
-func ParseSecretKeyV6(pkt []byte) (int, []byte, []byte, error) {
+// ParsePublicKeyV6 extracts the algorithm identifier and algorithm-specific material
+// from a v6 Public-Key (Tag 6) packet produced by BuildPublicKeyV6 or its composite
+// counterparts.
+func ParsePublicKeyV6(pkt []byte) (*PublicKey, error) {
 	tag, body, rest, err := ReadPacket(pkt)
 	if err != nil {
-		return 0, nil, nil, err
+		return nil, err
 	}
 	if len(rest) != 0 {
-		return 0, nil, nil, errors.New("pgp: unexpected extra data after secret key packet")
+		return nil, errors.New("pgp: unexpected extra data after public key packet")
+	}
+	if tag != 6 {
+		return nil, errors.New("pgp: packet is not Tag 6 public key")
+	}
+	pk, _, err := parsePublicKeyBody(body)
+	if err != nil {
+		return nil, err
+	}
+	return pk, nil
+}
+
+// ParseSecretKeyV6 extracts the algorithm identifier, public and secret key bytes from a
+// v6 Secret-Key (Tag 5) packet produced by BuildSecretKeyV6 or the composite builders.
+func ParseSecretKeyV6(pkt []byte) (*SecretKey, error) {
+	tag, body, rest, err := ReadPacket(pkt)
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) != 0 {
+		return nil, errors.New("pgp: unexpected extra data after secret key packet")
 	}
 	if tag != 5 {
-		return 0, nil, nil, errors.New("pgp: packet is not Tag 5 secret key")
+		return nil, errors.New("pgp: packet is not Tag 5 secret key")
 	}
 	if len(body) < 1+4+1+4+1 {
-		return 0, nil, nil, errors.New("pgp: secret key body too short")
+		return nil, errors.New("pgp: secret key body too short")
 	}
 	if body[0] != 6 {
-		return 0, nil, nil, errors.New("pgp: unsupported secret key version")
+		return nil, errors.New("pgp: unsupported secret key version")
 	}
-	alg := int(body[1+4])
-	pubLen := int(binary.BigEndian.Uint32(body[1+4+1 : 1+4+1+4]))
-	off := 1 + 4 + 1 + 4
-	if len(body) < off+pubLen+1 {
-		return 0, nil, nil, errors.New("pgp: truncated secret key material")
+	pk, consumed, err := parsePublicKeyBody(body)
+	if err != nil {
+		return nil, err
 	}
-	pub := body[off : off+pubLen]
-	s2kUsage := body[off+pubLen]
+	if len(body) < consumed+1 {
+		return nil, errors.New("pgp: truncated secret key material")
+	}
+	s2kUsage := body[consumed]
 	if s2kUsage != 0 {
-		return 0, nil, nil, fmt.Errorf("pgp: unsupported s2k usage %d", s2kUsage)
+		return nil, fmt.Errorf("pgp: unsupported s2k usage %d", s2kUsage)
 	}
-	priv := body[off+pubLen+1:]
-	switch alg {
+	priv := body[consumed+1:]
+	sk := &SecretKey{PublicKey: *pk}
+	switch pk.Algorithm {
 	case PKALG_X25519:
-		if len(pub) != 32 || len(priv) != 32 {
-			return 0, nil, nil, fmt.Errorf("pgp: expected 32 byte X25519 keys, got pub=%d priv=%d", len(pub), len(priv))
+		if len(priv) != 32 {
+			return nil, fmt.Errorf("pgp: expected 32 byte X25519 secret key, got %d", len(priv))
 		}
+		sk.ECCPrivate = append([]byte(nil), priv...)
 	case PKALG_X448:
-		if len(pub) != 56 || len(priv) != 56 {
-			return 0, nil, nil, fmt.Errorf("pgp: expected 56 byte X448 keys, got pub=%d priv=%d", len(pub), len(priv))
+		if len(priv) != 56 {
+			return nil, fmt.Errorf("pgp: expected 56 byte X448 secret key, got %d", len(priv))
 		}
+		sk.ECCPrivate = append([]byte(nil), priv...)
+	case PKALG_MLKEM768_X25519, PKALG_MLKEM1024_X448:
+		spec, errSpec := compositeSpecForAlgorithm(pk.Algorithm)
+		if errSpec != nil {
+			return nil, errSpec
+		}
+		eccSize := spec.eccLen + 1
+		if len(priv) < eccSize {
+			return nil, errors.New("pgp: composite secret key truncated ECC scalar")
+		}
+		if priv[0] != 0x40 {
+			return nil, errors.New("pgp: composite secret key missing SOS prefix")
+		}
+		sk.ECCPrivate = append([]byte(nil), priv[1:1+spec.eccLen]...)
+		rest := priv[eccSize:]
+		if len(rest) < 4 {
+			return nil, errors.New("pgp: composite secret key missing ML-KEM length")
+		}
+		mlLen := int(binary.BigEndian.Uint32(rest[:4]))
+		rest = rest[4:]
+		if mlLen != len(rest) {
+			return nil, errors.New("pgp: composite secret key ML-KEM length mismatch")
+		}
+		if mlLen != spec.mlkemPrivLen {
+			return nil, fmt.Errorf("pgp: composite secret key expected ML-KEM len %d got %d", spec.mlkemPrivLen, mlLen)
+		}
+		sk.MLKEMPrivate = append([]byte(nil), rest...)
 	default:
-		return 0, nil, nil, fmt.Errorf("pgp: unsupported secret key algorithm %d", alg)
+		return nil, fmt.Errorf("pgp: unsupported secret key algorithm %d", pk.Algorithm)
 	}
-	return alg, pub, priv, nil
+	return sk, nil
 }
